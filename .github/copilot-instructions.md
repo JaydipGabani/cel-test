@@ -2,134 +2,103 @@
 
 ## Project Overview
 
-This is a **CEL (Common Expression Language) test tooling** project for Kubernetes. It provides:
+This repository implements a **CEL (Common Expression Language) test tooling framework for Kubernetes**. It provides:
 
-1. A **Go package** (`celeval`) that wraps the upstream `k8s.io/apiserver/pkg/cel/testing/celtest` package for evaluating CEL expressions using the real Kubernetes CEL environment.
-2. A **declarative test format** (`*_test.cel`) — YAML files colocated with policy source — so policy authors can test CEL expressions without writing Go.
+1. A **Go testing library** (`celtest`) that wraps real Kubernetes CEL environments for unit-testing admission policies, CRD validation rules, DRA selectors, and auth expressions without a running cluster.
+2. A **standalone CLI tool** (`celtest`) that discovers and runs declarative `*_test.cel` YAML test files so policy authors can test CEL locally without writing Go.
 
-The project supports testing CEL expressions used in ValidatingAdmissionPolicy (VAP), Gatekeeper, Kyverno, DRA device selectors, and other Kubernetes CEL features.
+The project targets integration into `k8s.io/apiserver` (Go library) and `kubernetes-sigs/cel-test` (CLI wrapper).
 
-## Architecture
+## Repository Structure
 
-### Package Layout
-
-- **`celeval/`** — Core Go package. Thin wrapper around the vendored upstream `celtest` package. Adds YAML parsing for policy files (`src.cel`) and declarative test files (`*_test.cel`).
-  - `celeval.go` — Re-exports upstream types (`Evaluator`, `VAPPolicy`, `AdmissionInput`, etc.) and adds YAML parsing (`ParseVAPPolicy`, `ParseVAPPolicyFile`).
-  - `testfile.go` — Declarative test file parser (`ParseTestFile`) and test runner (`RunTestFile`, `RunTestFileRaw`, `RunTestFileWithEvaluator`, `DiscoverAndRunTests`).
-  - `celeval_test.go` — Go API tests demonstrating `EvalAdmission`, `EvalExpression`, `CompileCheck`, `WithVersion`, `WithPreambleVariables`.
-  - `testfile_test.go` — Discovers and runs `*_test.cel` files under `testdata/gatekeeper/`.
-  - `examples_test.go` — Discovers and runs `*_test.cel` files under `examples/`.
-- **`examples/`** — Example policies with colocated `src.cel` + `src_test.cel` files (vanilla VAP, Kyverno, DRA).
-- **`testdata/gatekeeper/`** — Gatekeeper-style policies with `src.cel` + `src_test.cel` (uses Gatekeeper preamble variables).
-- **`vendor/k8s.io/apiserver/pkg/cel/testing/celtest/`** — Vendored upstream package (the "real" evaluator). This is the code that would eventually live in `k8s.io/apiserver`.
-
-### Key Types (re-exported from upstream `celtest`)
-
-- `Evaluator` — Compiles and evaluates CEL using the real K8s CEL env with `admissioncel.NewCompositedCompiler`.
-- `VAPPolicy` — A parsed policy: `[]Variable` + `[]Validation`.
-- `AdmissionInput` — Test input: `Object`, `OldObject`, `Params`, `Request`, `Namespace`.
-- `AdmissionResult` — Evaluation result: `Allowed`, `Violations`, `Cost`.
-- `Option` — Evaluator options: `WithVersion(major, minor)`, `WithPreambleVariables(...)`, `WithCostLimit(...)`.
-
-### Evaluator Methods
-
-- `EvalAdmission(policy, input)` — Evaluate a full policy (all variables + validations). Returns `AdmissionResult`.
-- `EvalVariable(policy, varName, input)` — Evaluate a single named variable. Returns its value.
-- `EvalExpression(expr, input, extraVars)` — Evaluate an arbitrary CEL expression. Returns its value.
-- `CompileCheck(expr)` — Compile-only check (no evaluation). Returns compilation errors.
-
-### Gatekeeper vs Vanilla VAP
-
-- **Gatekeeper policies** use `WithPreambleVariables(GatekeeperPreamble()...)` which injects `anyObject` and `params` variables. Gatekeeper params are wrapped in `spec.parameters` structure. Use `RunTestFile` / `DiscoverAndRunTests`.
-- **Vanilla VAP / Kyverno policies** use no preamble. Params are passed directly. Use `RunTestFileRaw` / `DiscoverAndRunTestsRaw`.
-
-## Declarative Test Format (`*_test.cel`)
-
-Test files are YAML with this structure:
-
-```yaml
-mode: expression  # optional; "policy" (default) or "expression"
-tests:
-- name: "test name"
-  # What to test (pick one):
-  variable: varName       # test a specific variable's output
-  expression: "CEL expr"  # test an arbitrary expression
-  # (neither)             # test the whole policy (allowed/denied)
-
-  # Input:
-  object: { ... }
-  oldObject: { ... }
-  params: { ... }
-  request:
-    operation: CREATE
-
-  # Assertions:
-  expect:
-    # For whole-policy tests:
-    allowed: true/false
-    messageContains: "substring"
-    # For variable/expression tests:
-    value: <expected value>
-    size: <expected length>
-    contains: "substring"
-    # For error testing:
-    error: true
-    errorContains: "substring"
+```
+cel-test-tooling-proposal.md   # KEP / design document
+examples/                      # Example policies and tests by framework
+  dra-gpu-selector/            # DRA device-selector expressions
+  kyverno-disallow-latest/     # Kyverno CEL policy
+  vanilla-vap-replica-limit/   # Pure Kubernetes VAP (no framework)
+testdata/                      # Complex test data (e.g., Gatekeeper library)
 ```
 
-### Conventions
+## File Conventions
 
-- Policy files are named `src.cel`. Test files are named `src_test.cel`.
-- The test runner derives the policy path from the test path: `foo_test.cel` → `foo.cel`.
-- `mode: expression` means no policy file is needed — each test provides its own `expression`.
-- Variable and expression fields are mutually exclusive.
+| Pattern | Purpose |
+|---|---|
+| `src.cel` | Policy source — YAML with `variables:` and `validations:` |
+| `src_test.cel` | Declarative test file — YAML with `tests:` array |
+| `policy.yaml` | Optional reference Kubernetes resource |
 
-## Development Guidelines
+Discovery rule: `foo_test.cel` auto-pairs with `foo.cel` in the same directory. If no companion `.cel` exists, the test file must declare `mode: expression`.
 
-### Go Version & Dependencies
+## CEL Policy File Format (`src.cel`)
 
-- Go 1.25.1+. Module: `github.com/JaydipGabani/cel-test`.
-- Key deps: `k8s.io/apiserver` v0.35.2, `github.com/google/cel-go` v0.27.0, `gopkg.in/yaml.v3`.
-- All dependencies are vendored under `vendor/`.
+Policy files use YAML with two top-level keys:
 
-### Running Tests
+- **`variables:`** — array of `{name, expression}` objects defining named CEL variables. Variables may reference `object`, `oldObject`, `params`, `request`, and other variables via `variables.<name>`.
+- **`validations:`** — array of `{expression, messageExpression}` objects defining admission rules.
+
+Gatekeeper policies also reference preamble variables like `variables.anyObject` and `variables.params`.
+
+## CEL Test File Format (`src_test.cel`)
+
+Test files use YAML with:
+
+- **`mode:`** — `"policy"` (default) or `"expression"` (standalone CEL)
+- **`tests:`** — array of test cases, each containing:
+  - `name:` — unique descriptive test name
+  - Test target (mutually exclusive): `variable:` (single named variable), `expression:` (arbitrary CEL), or omitted (whole-policy test)
+  - Inputs: `object:`, `oldObject:`, `params:`, `request:` maps
+  - `expect:` — assertions using: `value`, `size`, `contains`, `allowed`, `messageContains`, `error`, `errorContains`
+
+### Three Testing Levels
+
+| Level | When to use | Key assertions |
+|---|---|---|
+| **Per-variable** | Testing individual computed variables in isolation | `variable:` + `expect.value` / `expect.size` / `expect.contains` |
+| **Whole-policy** | Testing full allow/deny outcomes | `expect.allowed` + `expect.messageContains` |
+| **Per-expression** | Testing arbitrary standalone CEL expressions | `expression:` + `expect.value` |
+
+## Go Library Usage
+
+```go
+import "k8s.io/apiserver/pkg/cel/testing/celtest"
+
+// Gatekeeper-style (with preamble)
+func TestGatekeeperPolicies(t *testing.T) {
+    celtest.DiscoverAndRunTests(t, "src/")
+}
+
+// Vanilla VAP / Kyverno (no preamble)
+func TestVAPPolicies(t *testing.T) {
+    celtest.DiscoverAndRunTestsRaw(t, "src/")
+}
+```
+
+## CLI Usage
 
 ```bash
-# Run all tests
-go test ./celeval/ -v
-
-# Run only Go API tests
-go test ./celeval/ -run TestEvalExpression
-
-# Run only declarative test file discovery (Gatekeeper policies)
-go test ./celeval/ -run TestCELPolicies
-
-# Run only example policies (vanilla VAP, Kyverno, DRA)
-go test ./celeval/ -run TestExamplePolicies
+celtest run src/...              # Discover and run all tests
+celtest compile src/policy.cel   # Type-check without running
+celtest eval 'expr' --input x.yaml  # Evaluate a single expression
 ```
 
-### Adding a New Policy Example
+## Coding Guidelines
 
-1. Create a directory under `examples/` (for vanilla/Kyverno) or `testdata/gatekeeper/` (for Gatekeeper).
-2. Write `src.cel` with `variables:` and `validations:` in YAML.
-3. Write `src_test.cel` with test cases covering variable-level and policy-level assertions.
-4. Existing discovery tests (`TestExamplePolicies` or `TestCELPolicies`) will automatically pick up the new files.
+- **Language:** Go, following standard Go conventions (`gofmt`, `go vet`).
+- **Dependencies:** `k8s.io/apiserver`, `k8s.io/apimachinery`, `github.com/google/cel-go` (indirectly via apiserver).
+- **Test naming:** Use descriptive strings (e.g., `"badContainers catches :latest"`, `"allows on UPDATE regardless"`).
+- **Comments:** Include comment headers in `.cel` files describing origin and purpose. Use `# ---- Section ----` separators in test files.
+- **Naming:** Follow Go `*_test.go` convention — test CEL files are always `*_test.cel`.
+- **Runner flavors:** `DiscoverAndRunTests` (Gatekeeper), `DiscoverAndRunTestsRaw` (vanilla/Kyverno), `RunTestFileWithEvaluator` (custom evaluator).
 
-### Code Style
+## Kubernetes CEL Contexts Covered
 
-- The `celeval` package is intentionally thin — it re-exports upstream types and adds only YAML parsing + declarative test running.
-- Do NOT duplicate upstream logic. If something belongs in the evaluator, it goes in `vendor/k8s.io/apiserver/pkg/cel/testing/celtest/celtest.go` (the vendored upstream).
-- Test files (`*_test.cel`) should test at multiple levels: individual variables first, then whole-policy pass/fail.
-- Use `t.Helper()` in all test helper functions.
-- Numeric comparisons in `deepEqual` handle `int` vs `int64` vs `float64` coercion from YAML parsing.
+The framework supports seven Kubernetes CEL use cases across implementation phases:
 
-### Important Patterns
-
-- `ParseVAPPolicy` / `ParseVAPPolicyFile` handle YAML → `VAPPolicy` conversion since the upstream package doesn't include YAML parsing.
-- `buildAdmissionInputFromTestCase` converts YAML test case maps into typed `AdmissionInput`, including `admissionv1.AdmissionRequest` conversion.
-- `wrapParams` wraps raw params in Gatekeeper's `spec.parameters` CRD structure for Gatekeeper-mode tests.
-- `DiscoverAndRunTests` / `DiscoverAndRunTestsRaw` glob for `*_test.cel` at two directory depths and auto-derive policy paths.
-
-### Design Doc
-
-The full KEP proposal is in `cel-test-tooling-proposal.md`. It covers motivation, user stories, architecture (shared base + feature extensions + preamble variables), and the implementation plan for upstream contribution to `k8s.io/apiserver`.
+1. **ValidatingAdmissionPolicy (VAP)** — `object`, `oldObject`, `params`, `request`, `authorizer`
+2. **MutatingAdmissionPolicy (MAP)** — same inputs plus mutation semantics
+3. **CRD validation rules** — `self`, `oldSelf` transition rules
+4. **matchConditions** — admission webhook match expressions
+5. **DRA device selectors** — `device.attributes`, `device.driver`, custom Semver type
+6. **Authentication (AuthN)** — user claim mappings
+7. **Authorization (AuthZ)** — structured authorization expressions
