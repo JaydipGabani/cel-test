@@ -8,7 +8,7 @@ owning-sig: sig-api-machinery
 related-issues:
   - https://github.com/kubernetes/kubernetes/issues/135351
   - https://github.com/kubernetes/kubernetes/issues/130570
-creation-date: 2026-02-02
+creation-date: 2026-02-01
 -->
 
 # KEP-NNNN: CEL Test Tooling for Kubernetes
@@ -36,6 +36,7 @@ creation-date: 2026-02-02
   - [Error Handling and Concurrency](#error-handling-and-concurrency)
   - [Usage Examples](#usage-examples)
   - [Comparison with Existing Tools](#comparison-with-existing-tools)
+  - [CLI Tool Design](#cli-tool-design)
   - [Implementation Plan](#implementation-plan)
   - [Graduation Criteria](#graduation-criteria)
   - [Open Questions for sig-api-machinery](#open-questions-for-sig-api-machinery)
@@ -47,14 +48,14 @@ creation-date: 2026-02-02
 
 ## Summary
 
-Kubernetes uses CEL (Common Expression Language) across 7 distinct features, each with its own CEL environment, variables, and custom types. Currently there is **no official testing utility** that sets up the correct CEL environment for any of these features. This KEP proposes:
+Kubernetes uses CEL (Common Expression Language) across 7 use cases spanning 5 distinct CEL environments, each with its own variables, and custom types. Currently there is **no official testing utility** that sets up the correct CEL environment for any of these features. This KEP proposes:
 
 1. **A Go testing package** (`k8s.io/apiserver/pkg/cel/testing/celtest`) that wraps the existing K8s CEL infrastructure into a simple API for evaluating CEL expressions in Go tests — using the real K8s CEL environment, not a custom one.
 2. **A standalone CLI tool** (`kubernetes-sigs/cel-test`) that discovers and runs declarative `*_test.cel` YAML test files so that policy authors who don't write Go can test CEL expressions locally.
 
 ## Motivation
 
-Users writing CEL expressions for Kubernetes must currently either deploy to a cluster (slow, no shift-left), use Gatekeeper-specific tooling like `gator` (only covers VAP), or roll their own evaluator (inevitably incomplete). The building blocks exist inside `k8s.io/apiserver`, they just aren't packaged for external testing use.
+Users writing CEL expressions for Kubernetes must currently either deploy to a cluster (slow, no shift-left), use Gatekeeper-specific tooling like `gator` (covers Gatekeeper policies only, not other K8s CEL features), or roll their own evaluator (inevitably incomplete). The building blocks exist inside `k8s.io/apiserver`, they just aren't packaged for external testing use.
 
 ### Goals
 
@@ -108,12 +109,12 @@ If the test package constructs its CEL environment differently from the real adm
 | Layer | Upstream code reused | Identical to production? |
 |---|---|---|
 | **Base environment** | `environment.MustBaseEnvSet(ver)` | ✅ Yes — same versioned libraries |
-| **Variable composition** | `admissioncel.NewCompositedCompiler()`, `CompileAndStoreVariables()` | ✅ Yes — same compiler, same type propagation |
-| **Typed declarations** | `admissioncel.BuildRequestType()`, `BuildNamespaceType()` (available via compiler) | ✅ Yes — same typed DeclTypes |
-| **Namespace filtering** | `admissioncel.CreateNamespaceObject()` | ✅ Yes — same safe-field filter |
+| **Variable composition** | `admissioncel.NewCompositedCompiler()` ([composition.go](https://github.com/kubernetes/kubernetes/blob/master/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/composition.go)), `CompileAndStoreVariables()` | ✅ Yes — same compiler, same type propagation |
+| **Typed declarations** | `admissioncel.BuildRequestType()`, `BuildNamespaceType()` (in [compile.go](https://github.com/kubernetes/kubernetes/blob/master/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/compile.go)) | ✅ Yes — same typed DeclTypes |
+| **Namespace filtering** | `admissioncel.CreateNamespaceObject()` (in [condition.go](https://github.com/kubernetes/kubernetes/blob/master/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/condition.go)) | ✅ Yes — same safe-field filter |
 | **Evaluation loop** | Custom loop mirroring `ForInput()` | ⚠️ Equivalent — see below |
 
-The evaluation loop is the one piece that is reimplemented rather than called directly. The upstream `ConditionEvaluator.ForInput()` requires `admission.VersionedAttributes` — a type tied to the full K8s admission pipeline — which cannot be cleanly constructed from unstructured test input. The custom loop follows the same preamble → variables → validations ordering and uses the same `StoredExpressionsEnv` for evaluation.
+The evaluation loop is the one piece that is reimplemented rather than called directly. The upstream `ForInput()` method (in [condition.go](https://github.com/kubernetes/kubernetes/blob/master/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/condition.go) and [composition.go](https://github.com/kubernetes/kubernetes/blob/master/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/composition.go)) requires `admission.VersionedAttributes` — a type tied to the full K8s admission pipeline — which cannot be cleanly constructed from unstructured test input. The activation bindings are implemented in [activation.go](https://github.com/kubernetes/kubernetes/blob/master/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/activation.go) (`evaluationActivation` struct). The custom loop follows the same preamble → variables → validations ordering and uses the same `StoredExpressionsEnv` for evaluation.
 
 **This is why the package should live in `k8s.io/apiserver`**: inside the K8s tree, it can either call `ForInput()` directly (by constructing `VersionedAttributes` from internal types) or expose a simpler evaluation method that accepts unstructured inputs. The prototype proves the API design; the upstream implementation eliminates the evaluation gap.
 
@@ -129,17 +130,17 @@ If a user pins `WithVersion(1, 28)` but the package ships with K8s 1.33, the bas
 
 ### CEL Features and Environments
 
-Kubernetes uses CEL across **7 distinct features**, each with its own CEL environment, variables, and custom types:
+Kubernetes uses CEL across **7 use cases** spanning **5 distinct CEL environments** (VAP/MAP/matchConditions share the same admission env, AuthN has 2 sub-envs). Each has its own variables and custom types:
 
-| # | Feature | Package | Variables | Custom Types/Libraries |
-|---|---------|---------|-----------|----------------------|
-| 1 | **ValidatingAdmissionPolicy (VAP)** | `k8s.io/apiserver/pkg/admission/plugin/cel` | `object`, `oldObject`, `request`, `params`, `namespaceObject`, `authorizer`, `variables` | AdmissionRequest, Namespace, Authorizer types |
-| 2 | **MutatingAdmissionPolicy (MAP)** | same as VAP + mutation | same as VAP + JSONPatch types | `library.JSONPatch`, `mutation.DynamicTypeResolver` |
-| 3 | **CRD Validation Rules** | `k8s.io/apiextensions-apiserver/pkg/apiserver/schema/cel` | `self`, `oldSelf` | Schema-derived types from OpenAPI |
-| 4 | **Webhook matchConditions** | `k8s.io/apiserver/pkg/admission/plugin/cel` (via FilterCompiler) | `object`, `oldObject`, `request`, `params` | AdmissionRequest type |
-| 5 | **Dynamic Resource Allocation (DRA)** | `k8s.io/dynamic-resource-allocation/cel` | `device` (with `.driver`, `.attributes`, `.capacity`) | Custom `Semver` type (blang/semver), `DRADevice` typed object, custom map-with-default |
-| 6 | **Authentication (AuthN)** | `k8s.io/apiserver/pkg/authentication/cel` | `claims` OR `user` (two separate envs) | `UserInfo` typed object, claims as `map<string, any>` |
-| 7 | **Authorization (AuthZ)** | `k8s.io/apiserver/pkg/authorization/cel` | `request` (SubjectAccessReviewSpec) | `SubjectAccessReviewSpec`, `ResourceAttributes`, `FieldSelector`, `LabelSelector` types |
+| # | Feature | Package | Variables | Custom Types/Libraries | Env |
+|---|---------|---------|-----------|----------------------|---|
+| 1 | **ValidatingAdmissionPolicy (VAP)** | `k8s.io/apiserver/pkg/admission/plugin/cel` | `object`, `oldObject`, `request`, `params`, `namespaceObject`, `authorizer`, `variables` | AdmissionRequest, Namespace, Authorizer types | Admission |
+| 2 | **MutatingAdmissionPolicy (MAP)** | same as VAP + `mutation.go` | same as VAP | `library.JSONPatch` (adds `jsonpatch.escapeKey()`), `mutation.DynamicTypeResolver` | Admission (extended) |
+| 3 | **CRD Validation Rules** | `k8s.io/apiextensions-apiserver/pkg/apiserver/schema/cel` | `self`, `oldSelf` | Schema-derived types from OpenAPI | CRD |
+| 4 | **Webhook matchConditions** | `k8s.io/apiserver/pkg/admission/plugin/cel` (same package as VAP via `ConditionCompiler`) | `object`, `oldObject`, `request`, `params` | AdmissionRequest type | Admission (subset) |
+| 5 | **Dynamic Resource Allocation (DRA)** | `k8s.io/dynamic-resource-allocation/cel` | `device` (with `.driver`, `.attributes`, `.capacity`) | `DRADevice` typed object, custom map-with-default. Note: `Semver` type is now in the base env since 1.33 via `library.SemverLib` | DRA |
+| 6 | **Authentication (AuthN)** | `k8s.io/apiserver/pkg/authentication/cel` | `claims` OR `user` (two separate envs via `mustBuildEnvs()`) | `kubernetes.UserInfo` typed object (username, uid, groups, extra), claims as `map(string, any)` | AuthN (×2) |
+| 7 | **Authorization (AuthZ)** | `k8s.io/apiserver/pkg/authorization/cel` | `request` (SubjectAccessReviewSpec) | `kubernetes.SubjectAccessReviewSpec`, `kubernetes.ResourceAttributes` (with optional `fieldSelector`/`labelSelector` behind `AuthorizeWithSelectors` feature gate), `kubernetes.NonResourceAttributes`, `kubernetes.SelectorRequirement` | AuthZ |
 
 ### How CEL Environments Are Built Today
 
@@ -444,13 +445,19 @@ type Option func(*Evaluator)
 
 // WithVersion sets the K8s compatibility version (default: latest).
 // The base environment is versioned — some libraries are only available from certain K8s versions:
-//   - 1.0+: URLs, Regex, Lists, Strings
+//   - 1.0+: URLs, Regex, Lists (K8s custom), Strings (v0 until 1.29)
 //   - 1.27+: Authz library
 //   - 1.28+: Quantity, OptionalTypes, cross-type numeric comparisons
-//   - 1.29+: AST validators (duration, timestamp, regex, homogeneous literals)
-//   - 1.30+: Sets
-//   - 1.31+: IP, CIDR
-//   - 1.32+: Semver, JSONPatch, Format
+//   - 1.29+: AST validators, Strings (v2 upgrade), Sets
+//   - 1.30+: IP, CIDR
+//   - 1.31+: Format, AuthzSelectors (feature-gated)
+//   - 1.32+: TwoVarComprehensions
+//   - 1.33+: Semver
+//   - 1.34+: Lists ext (cel-go v3)
+//
+// Note: JSONPatch is NOT in the base environment. It exists as library.JSONPatch()
+// in k8s.io/apiserver/pkg/cel/library but is only added by the MAP (mutation)
+// feature-specific extension, not by MustBaseEnvSet.
 func WithVersion(major, minor uint) Option { ... }
 
 // NewEvaluator creates a CEL evaluator.
@@ -465,7 +472,7 @@ func NewEvaluator(opts ...Option) (*Evaluator, error) { ... }
 // Used by EvalAdmission for VAP, MAP, and matchConditions.
 //
 // Fields map to CEL variables following the same conventions as the K8s API server
-// (see k8s.io/apiserver/pkg/admission/plugin/cel/filter.go evaluationActivation):
+// (see k8s.io/apiserver/pkg/admission/plugin/cel/activation.go evaluationActivation):
 //
 //   | AdmissionInput field | CEL variable            | CEL compile-time type              | Default if nil                      |
 //   |----------------------|-------------------------|------------------------------------|-------------------------------------|
@@ -541,7 +548,7 @@ func WithCostLimit(limit int64) Option { ... }
 
 // PerCallLimit is the K8s API server's per-expression cost limit.
 // Expressions exceeding this limit are rejected at runtime.
-const PerCallLimit = celconfig.PerCallLimit  // currently 1,000,000
+const PerCallLimit = cel.PerCallLimit  // currently 1,000,000 (from k8s.io/apiserver/pkg/apis/cel)
 
 // EvalAdmission evaluates a VAP/MAP/matchCondition policy against admission input.
 func (e *Evaluator) EvalAdmission(policy *VAPPolicy, input *AdmissionInput) (*AdmissionResult, error) { ... }
@@ -634,20 +641,22 @@ func WithPreambleVariables(vars ...Variable) Option { ... }
 ### Architecture: Shared Base, Feature Extensions, Preamble Variables
 
 ```
-┌─────────────────────────────────────────────────────┐
-│            environment.MustBaseEnvSet(ver)            │
-│  URLs, Regex, Lists, Strings, Sets, Encoders, Math   │
-│  Quantity, IP, CIDR, Semver, Authz, Format, JSONPatch │
-│  (versioned by K8s release: 1.0 → 1.32+)            │
-└───────────────────────┬─────────────────────────────┘
-                        │ .Extend()
-        ┌───────┬───────┼───────┬───────┬───────┬───────┐
-        ▼       ▼       ▼       ▼       ▼       ▼       ▼
-      VAP     MAP     CRD     Match   DRA    AuthN   AuthZ
-   object   +patch   self    object  device  claims  request
-   oldObj           oldSelf  oldObj  +semver  user   +field/
-   request          (typed)  request +bind          label
-   params                    params                 selector
+┌──────────────────────────────────────────────────────────┐
+│              environment.MustBaseEnvSet(ver)               │
+│  URLs, Regex, Lists, Strings, Sets, Quantity, Authz       │
+│  IP, CIDR, Format, AuthzSelectors, Semver                 │
+│  OptionalTypes, TwoVarComprehensions                      │
+│  (versioned by K8s release: 1.0 → 1.34+)                 │
+│  Note: JSONPatch is NOT in base — added by MAP extension  │
+└────────────────────────┬─────────────────────────────────┘
+                         │ .Extend()
+        ┌───────┬────────┼───────┬───────┬───────┬───────┐
+        ▼       ▼        ▼       ▼       ▼       ▼       ▼
+      VAP     MAP      CRD     Match   DRA    AuthN   AuthZ
+   object   +jsonpat  self    object  device  claims  request
+   oldObj   ch escape  oldSelf  oldObj  +bind   user   +field/
+   request  +dyntype  (typed)  request +map          label
+   params                      params  default       selector
    ns/authz
    variables
         │
@@ -789,23 +798,216 @@ func TestFilterExpression(t *testing.T) {
 | Tool | Env Accuracy | API | Cluster | Scope |
 |---|---|---|---|---|
 | **This proposal** | ✅ Real K8s env | ✅ Simple Go API | ❌ No | All 7 CEL features |
-| gator CLI | ✅ Real K8s env | ⚠️ YAML suite files | ❌ No | VAP only (Gatekeeper) |
+| gator CLI | ✅ Real K8s env | ⚠️ YAML suite files | ❌ No | Gatekeeper policies only (OPA + CEL templates) |
 | kaptest | ⚠️ Third-party | ✅ Simple | ❌ No | VAP only |
 | kubectl-validate (#130570) | ✅ Real K8s env | ⚠️ CLI tool | ❌ No | Schema validation |
 | Custom `cel-go` (celeval) | ❌ Incomplete env | ✅ Simple Go API | ❌ No | Custom subset |
 
+### CLI Tool Design
+
+The `celtest` CLI (`kubernetes-sigs/cel-test`, Phase 1b) is a thin wrapper over the Go library. This section specifies its commands, flags, output format, and configuration.
+
+#### Commands
+
+##### `celtest run [paths...]`
+
+Discover and run `*_test.cel` files.
+
+```bash
+# Run all tests under src/ recursively
+celtest run src/
+
+# Run a specific test file
+celtest run src/pod-security-policy/privileged-containers/src_test.cel
+
+# Run multiple directories
+celtest run src/pod-security-policy/ src/replica-limit/
+```
+
+**Flags:**
+
+| Flag | Type | Default | Description |
+|---|---|---|---|
+| `--version` | `string` | latest | K8s compatibility version (e.g., `1.31`). Maps to `WithVersion()`. |
+| `--preamble` | `string` | none | Path to preamble config file (see below). |
+| `--output` / `-o` | `string` | `text` | Output format: `text`, `json`, `junit`. |
+| `--verbose` / `-v` | `bool` | false | Show passing tests and evaluation details. |
+| `--fail-fast` | `bool` | false | Stop on first test failure. |
+| `--cost-limit` | `int` | 0 (none) | CEL cost budget per expression. Maps to `WithCostLimit()`. |
+
+##### `celtest compile [files...]`
+
+Compile-check all expressions in policy files without evaluating.
+
+```bash
+# Compile-check a single policy
+celtest compile src/privileged-containers/src.cel
+
+# Compile-check all policies under a directory
+celtest compile src/
+```
+
+**Flags:**
+
+| Flag | Type | Default | Description |
+|---|---|---|---|
+| `--version` | `string` | latest | K8s compatibility version. Restricts available libraries. |
+| `--feature` | `string` | `admission` | CEL context: `admission`, `crd`, `dra`, `authn-claims`, `authn-user`, `authz`. Determines which variables and types are available. |
+| `--output` / `-o` | `string` | `text` | Output format: `text`, `json`. |
+
+##### `celtest eval '<expression>' [flags]`
+
+Evaluate a single CEL expression interactively.
+
+```bash
+# Evaluate with object from YAML file
+celtest eval 'object.spec.replicas > 3' --object pod.yaml
+
+# Evaluate with inline JSON
+celtest eval 'has(object.metadata.labels)' --object '{"metadata":{"labels":{"app":"web"}}}'
+
+# Evaluate with params and request
+celtest eval 'object.spec.replicas <= params.maxReplicas' \
+  --object deployment.yaml \
+  --params '{"maxReplicas": 5}'
+
+# Evaluate with specific K8s version
+celtest eval 'semver("1.2.3").isGreaterThan(semver("1.0.0"))' --version 1.33
+```
+
+**Flags:**
+
+| Flag | Type | Description |
+|---|---|---|
+| `--object` | `string` | Path to YAML/JSON file or inline JSON for `object` variable. |
+| `--old-object` | `string` | Path/inline for `oldObject` variable. |
+| `--params` | `string` | Path/inline for `params` variable. |
+| `--request` | `string` | Path/inline for `request` variable. Default: `{"operation":"CREATE"}`. |
+| `--version` | `string` | K8s compatibility version. |
+| `--feature` | `string` | CEL context (same as `compile`). |
+
+#### Exit Codes
+
+| Code | Meaning |
+|---|---|
+| `0` | All tests passed / expression compiled / evaluation succeeded |
+| `1` | One or more test failures or evaluation errors |
+| `2` | Configuration error (bad flags, unparseable YAML, missing files) |
+| `3` | CEL compilation error (for `compile` and `eval` commands) |
+
+#### Output Formats
+
+**Text (default):**
+```
+=== RUN   src/privileged-containers/src_test.cel
+--- PASS: containers extracts spec.containers (0.002s)
+--- PASS: badContainers finds privileged container (0.001s)
+--- FAIL: allows on UPDATE regardless (0.001s)
+        expected allowed=true, got allowed=false
+=== FAIL: src/privileged-containers/src_test.cel (2 passed, 1 failed)
+
+FAIL	2 files, 5 passed, 1 failed
+```
+
+**JSON (`-o json`):**
+```json
+{
+  "files": [
+    {
+      "path": "src/privileged-containers/src_test.cel",
+      "tests": [
+        {"name": "containers extracts spec.containers", "passed": true, "duration": "2ms"},
+        {"name": "allows on UPDATE regardless", "passed": false, "error": "expected allowed=true, got allowed=false", "duration": "1ms"}
+      ]
+    }
+  ],
+  "summary": {"total": 5, "passed": 4, "failed": 1}
+}
+```
+
+**JUnit XML (`-o junit`):**
+Standard JUnit XML format for CI systems (Jenkins, GitHub Actions, etc.).
+
+#### Configuration File (`.celtest.yaml`)
+
+For projects with multiple policies, a `.celtest.yaml` file at the repository root provides defaults:
+
+```yaml
+# .celtest.yaml
+version: "1.31"          # Default K8s compatibility version
+output: text             # Default output format
+
+# Preamble variables for framework-specific testing
+preamble:
+  variables:
+  - name: anyObject
+    expression: 'has(request.operation) && request.operation == "DELETE" && object == null ? oldObject : object'
+  - name: params
+    expression: '!has(params.spec) ? null : !has(params.spec.parameters) ? null : params.spec.parameters'
+  # Parameter wrapping (Gatekeeper wraps params in {spec: {parameters: ...}})
+  wrapParams: true
+```
+
+The `--preamble` flag can also point to this file explicitly:
+```bash
+celtest run src/ --preamble .celtest.yaml
+```
+
+Without `--preamble` or `.celtest.yaml`, the CLI runs in raw mode (equivalent to `DiscoverAndRunTestsRaw`).
+
+#### Example CI Workflow (GitHub Actions)
+
+```yaml
+name: CEL Policy Tests
+on: [push, pull_request]
+jobs:
+  cel-test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-go@v5
+      with:
+        go-version: '1.23'
+    - run: go install sigs.k8s.io/cel-test/cmd/celtest@latest
+    - run: celtest run src/ --version 1.31 -o junit > test-results.xml
+    - uses: dorny/test-reporter@v1
+      if: always()
+      with:
+        name: CEL Tests
+        path: test-results.xml
+        reporter: java-junit
+```
+
+#### Error Reporting
+
+Compilation errors include the expression text, error position, and a descriptive message:
+```
+ERROR: src/policy.cel:3 - variable "maxReplicas"
+  | expression: params.maxReplica
+  |                    ^^^^^^^^^^^
+  | ERROR: undecayed reference to field 'maxReplica' (did you mean 'maxReplicas'?)
+```
+
+Evaluation errors show the test name, expression, and runtime error:
+```
+--- FAIL: string(map) fails at runtime
+  expression: string(object.metadata.labels)
+  error: no such overload: string(map[string]string)
+  expected: error=true ✓
+```
+
 ### Implementation Plan
 
 #### Phase 1a: Core Go Library (MVP)
-- `NewEvaluator` with admission-style environment (covers VAP, MAP, matchConditions)
-- `EvalAdmission` for full VAP/MAP policy evaluation
+- `NewEvaluator` with admission-style environment (covers VAP, MAP compile/expression testing, matchConditions)
+- `EvalAdmission` for full VAP policy evaluation (validations returning allowed/denied)
 - `EvalExpression` for single expression testing
 - `CompileCheck` for compilation validation
 - `ParseVAPPolicy` / `ParseVAPPolicyFile` helpers
 - `WithVersion` for K8s version pinning
 - `WithPreambleVariables` for framework injection (Gatekeeper, Kyverno)
 - Declarative `*_test.cel` runner (`DiscoverAndRunTests`)
-- **Note**: VAP, MAP, and matchConditions share the same base admission env (`k8s.io/apiserver/pkg/admission/plugin/cel/compile.go`) with different `OptionalVariableDeclarations` flags
+- **Note**: VAP, MAP, and matchConditions share the same base admission env (`k8s.io/apiserver/pkg/admission/plugin/cel/compile.go`) with different `OptionalVariableDeclarations` flags (`HasParams`, `HasAuthorizer`, `HasPatchTypes`). MAP mutation evaluation (applying JSONPatch mutations and returning patched objects) is out of scope for Phase 1a — `EvalAdmission` evaluates validation expressions only. MAP mutation semantics require `mutation.DynamicTypeResolver` and produce different result types.
 
 #### Phase 1b: CLI Tool (`kubernetes-sigs/cel-test`)
 - `celtest run` — discovers and runs `*_test.cel` files (wraps `DiscoverAndRunTests`)
@@ -813,7 +1015,7 @@ func TestFilterExpression(t *testing.T) {
 - `celtest eval` — evaluates a single expression against YAML/JSON input
 - `--version` flag maps to `WithVersion`
 - `--preamble` flag or config file for framework-specific preamble variables
-- Installable via `go install kubernetes-sigs/cel-test@latest`
+- Installable via `go install sigs.k8s.io/cel-test/cmd/celtest@latest`
 - **Note**: The CLI is a thin `main()` wrapper over the Go library. No separate API surface to stabilize.
 
 #### Phase 2: CRD Validation Rules
@@ -826,15 +1028,14 @@ func TestFilterExpression(t *testing.T) {
 #### Phase 3: DRA Device Selectors
 - `EvalDRASelector` with `device` variable (typed `DRADevice` object)
 - `EvalDRASelector` returning `(bool, error)`
-- Custom DRA semver library (`k8s.io/dynamic-resource-allocation/cel.SemverLib()`)
 - Map-with-default behavior for attribute/capacity lookups (matching `newStringInterfaceMapWithDefault`)
-- **Note**: DRA env is unique — it has its own `Semver` type from `blang/semver/v4` and custom `mapper` that returns empty maps for unknown attribute domains
+- **Note**: As of K8s 1.33, `library.SemverLib` has been promoted to the base environment (`k8s.io/apiserver/pkg/cel/library/semverlib.go`), so it is available in all CEL contexts without DRA-specific setup. DRA's unique aspects are the `DRADevice` typed object and `ext.Bindings()` from `k8s.io/dynamic-resource-allocation/cel`, plus the custom `mapper` that returns empty maps for unknown attribute domains.
 
 #### Phase 4: Authentication & Authorization
 - `EvalAuthNClaims` and `EvalAuthNUser` with dual envs: `claims` (map) and `user` (typed UserInfo)
 - `EvalAuthZ` with typed `SubjectAccessReviewSpec` including optional `fieldSelector`/`labelSelector`
 - `EvalAuthNClaims`, `EvalAuthNUser`, `EvalAuthZ` methods
-- **Note**: AuthN uses two separate `EnvSet` instances (`mustBuildEnvs` in `authentication/cel/compile.go`). AuthZ includes AST analysis for field/label selector usage detection.
+- **Note**: AuthN uses two separate `EnvSet` instances (`mustBuildEnvs()` in `authentication/cel/compile.go`) keyed by variable name: `"claims"` env (variable `claims` typed `map(string, any)`) and `"user"` env (variable `user` typed `kubernetes.UserInfo` with fields: username, uid, groups, extra). AuthZ uses a single env with `request` typed as `kubernetes.SubjectAccessReviewSpec`. AuthZ includes AST analysis (`celast.PreOrderVisit`) for field/label selector usage detection, stored in `CompilationResult.UsesFieldSelector`/`UsesLabelSelector`.
 
 #### Phase 5: Advanced Features
 - Authorizer mock support for `authorizer` / `authorizer.requestResource` variables
@@ -844,7 +1045,7 @@ func TestFilterExpression(t *testing.T) {
 ### Graduation Criteria
 
 #### Alpha (Phase 1a-1b)
-- `EvalAdmission` fully functional for VAP/MAP/matchConditions evaluation
+- `EvalAdmission` fully functional for VAP/matchConditions validation evaluation (MAP expression testing supported; MAP mutation evaluation deferred)
 - `EvalExpression` and `CompileCheck` for expression-level testing
 - `WithPreambleVariables` supports framework injection (Gatekeeper validated)
 - Package located in `k8s.io/apiserver/pkg/cel/testing/celtest`
@@ -866,19 +1067,17 @@ func TestFilterExpression(t *testing.T) {
 
 ### Open Questions for sig-api-machinery
 
-1. **Should DRA's custom `Semver` type and `ext.Bindings()` be promoted to the base environment?**
-   **Proposed: No.** DRA-specific libraries stay in DRA's feature-specific evaluator. The base env should only contain libraries that are shared across multiple features.
 
-2. **Should AuthN's dual-env pattern (claims vs user) be modeled as two presets or one with a sub-option?**
+1. **Should AuthN's dual-env pattern (claims vs user) be modeled as two presets or one with a sub-option?**
    **Proposed: Two sub-methods on one evaluator** (`EvalAuthNClaims`, `EvalAuthNUser`) rather than two presets. This avoids preset proliferation.
 
-3. **How should CRD schema-typed `self`/`oldSelf` be handled — require OpenAPI schema input, or support untyped `DynType` for simpler testing?**
+2. **How should CRD schema-typed `self`/`oldSelf` be handled — require OpenAPI schema input, or support untyped `DynType` for simpler testing?**
    **Proposed: Support both.** Default to `DynType` for simplicity; optionally accept an OpenAPI schema for type-checked evaluation.
 
-4. **Should this package provide assertion helpers (`celtest.RequireAllowed(t, result)`) or keep it minimal?**
+3. **Should this package provide assertion helpers (`celtest.RequireAllowed(t, result)`) or keep it minimal?**
    **Proposed: Keep the core API minimal.** Assertion helpers (`celtest.RequireAllowed`) can be added in Phase 5 or by downstream projects.
 
-5. **What's the right level of cost tracking granularity to expose in test results?**
+4. **What's the right level of cost tracking granularity to expose in test results?**
    **Proposed: Expose total cost as `int64` on result types.** Per-expression cost breakdown is future work.
 
 ## Test Plan
@@ -907,7 +1106,7 @@ Integration testing is deferred to adopting projects (gatekeeper-library, upstre
 
 gator already provides CEL testing for Gatekeeper policies via `suite.yaml`. However:
 - gator is Gatekeeper-specific — it requires `ConstraintTemplate` CRDs and Gatekeeper's variable injection model.
-- gator only covers VAP (admission policies). It cannot test CRD validation rules, DRA selectors, AuthN/AuthZ expressions.
+- gator only covers Gatekeeper admission policies (both OPA and CEL templates). It cannot test CRD validation rules, DRA selectors, AuthN/AuthZ expressions, or non-Gatekeeper VAPs.
 - gator tests whole policies, not individual expressions or variables.
 
 This proposal complements gator by providing expression-level and cross-feature testing that gator does not address.
