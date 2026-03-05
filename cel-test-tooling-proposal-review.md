@@ -8,7 +8,7 @@ owning-sig: sig-api-machinery
 related-issues:
   - https://github.com/kubernetes/kubernetes/issues/135351
   - https://github.com/kubernetes/kubernetes/issues/130570
-creation-date: 2026-02-02
+creation-date: 2026-02-01
 -->
 
 # KEP-NNNN: CEL Test Tooling for Kubernetes
