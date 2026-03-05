@@ -3,7 +3,13 @@ mode: expression
 tests:
 # DRA device selector expressions — standalone CEL (no policy structure).
 # These test the kinds of expressions used in ResourceClaim device selectors,
-# evaluated using the base K8s CEL environment (not the full DRA env with Semver type).
+# evaluated using the base K8s CEL environment (not the full DRA env).
+#
+# NOTE: Real DRA selectors use `device.attributes["domain"].key`, not `object.attributes.key`.
+# This example uses `object.*` because the full DRA environment (Phase 3) is not yet
+# implemented. Once Phase 3 ships with EvalDRASelector and the typed `device` variable,
+# these expressions should be rewritten to use the real DRA variable model.
+# The Semver type IS available in the base env since K8s 1.33 (library.SemverLib).
 
 - name: "GPU memory above threshold"
   expression: "object.attributes.memory >= 8"
