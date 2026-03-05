@@ -1,0 +1,87 @@
+tests:
+# ---- Variable-level tests ----
+
+- name: "replicas reads spec.replicas"
+  variable: replicas
+  params:
+    maxReplicas: 5
+  object:
+    spec:
+      replicas: 3
+  expect:
+    value: 3
+
+- name: "replicas defaults to 1 when missing"
+  variable: replicas
+  params:
+    maxReplicas: 5
+  object:
+    spec: {}
+  expect:
+    value: 1
+
+- name: "maxReplicas reads from params"
+  variable: maxReplicas
+  params:
+    maxReplicas: 10
+  object:
+    spec: {}
+  expect:
+    value: 10
+
+# ---- Policy-level tests ----
+
+- name: "allows replicas within limit"
+  params:
+    maxReplicas: 5
+  object:
+    metadata:
+      name: my-deploy
+    spec:
+      replicas: 3
+  expect:
+    allowed: true
+
+- name: "allows replicas at limit"
+  params:
+    maxReplicas: 5
+  object:
+    metadata:
+      name: my-deploy
+    spec:
+      replicas: 5
+  expect:
+    allowed: true
+
+- name: "denies replicas exceeding limit"
+  params:
+    maxReplicas: 5
+  object:
+    metadata:
+      name: my-deploy
+    spec:
+      replicas: 10
+  expect:
+    allowed: false
+    messageContains: "10 replicas, max allowed is 5"
+
+- name: "defaults to 1 replica when not specified"
+  params:
+    maxReplicas: 5
+  object:
+    metadata:
+      name: my-deploy
+    spec: {}
+  expect:
+    allowed: true
+
+- name: "denies when max is 0 and replicas default to 1"
+  params:
+    maxReplicas: 0
+  object:
+    metadata:
+      name: my-deploy
+    spec: {}
+  expect:
+    allowed: false
+    messageContains: "1 replicas, max allowed is 0"

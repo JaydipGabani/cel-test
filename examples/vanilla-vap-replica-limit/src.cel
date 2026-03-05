@@ -1,0 +1,33 @@
+# Vanilla Kubernetes VAP: Limit deployment replicas.
+# No framework (no Gatekeeper, no Kyverno) — pure ValidatingAdmissionPolicy.
+#
+# Equivalent VAP YAML:
+#   apiVersion: admissionregistration.k8s.io/v1
+#   kind: ValidatingAdmissionPolicy
+#   metadata:
+#     name: limit-replicas
+#   spec:
+#     matchConstraints:
+#       resourceRules:
+#       - apiGroups: ["apps"]
+#         apiVersions: ["v1"]
+#         operations: ["CREATE", "UPDATE"]
+#         resources: ["deployments"]
+#     variables:
+#     - name: maxReplicas
+#       expression: "params.maxReplicas"
+#     - name: replicas
+#       expression: "has(object.spec.replicas) ? object.spec.replicas : 1"
+#     validations:
+#     - expression: "variables.replicas <= variables.maxReplicas"
+#       messageExpression: "'Deployment ' + object.metadata.name + ' has ' + string(variables.replicas) + ' replicas, max allowed is ' + string(variables.maxReplicas)"
+
+variables:
+- name: maxReplicas
+  expression: 'params.maxReplicas'
+- name: replicas
+  expression: 'has(object.spec.replicas) ? object.spec.replicas : 1'
+
+validations:
+- expression: 'variables.replicas <= variables.maxReplicas'
+  messageExpression: '"Deployment " + object.metadata.name + " has " + string(variables.replicas) + " replicas, max allowed is " + string(variables.maxReplicas)'

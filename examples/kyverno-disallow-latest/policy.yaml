@@ -1,0 +1,42 @@
+# Kyverno ClusterPolicy using CEL: Disallow containers with :latest tag or no tag.
+#
+# This is a REAL Kyverno policy using the validate.cel syntax.
+# Kyverno natively supports CEL expressions in policies via the cel: block.
+#
+# Reference: https://kyverno.io/docs/writing-policies/validate/
+# Real example from: kyverno/kyverno test/conformance/chainsaw/validate/clusterpolicy/standard/cel/
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: disallow-latest-tag
+spec:
+  background: false
+  rules:
+    - name: disallow-latest-tag
+      match:
+        any:
+        - resources:
+            kinds:
+              - Pod
+            operations:
+              - CREATE
+              - UPDATE
+      validate:
+        failureAction: Enforce
+        cel:
+          variables:
+            - name: containers
+              expression: "has(object.spec.containers) ? object.spec.containers : []"
+            - name: initContainers
+              expression: "has(object.spec.initContainers) ? object.spec.initContainers : []"
+            - name: allContainers
+              expression: "variables.containers + variables.initContainers"
+            - name: badContainers
+              expression: >
+                variables.allContainers.filter(c,
+                  c.image.endsWith(":latest") || !c.image.contains(":")
+                ).map(c, c.name + " uses image " + c.image)
+          expressions:
+            - expression: "size(variables.badContainers) == 0"
+              messageExpression: >
+                "Containers must not use :latest tag or untagged images: " + variables.badContainers.join(", ")

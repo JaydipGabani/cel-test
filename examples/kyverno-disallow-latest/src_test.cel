@@ -1,0 +1,127 @@
+tests:
+# ---- Variable-level tests ----
+
+- name: "containers extracts spec.containers"
+  variable: containers
+  object:
+    spec:
+      containers:
+      - name: app
+        image: nginx:1.25
+  expect:
+    size: 1
+
+- name: "allContainers combines containers + initContainers"
+  variable: allContainers
+  object:
+    spec:
+      containers:
+      - name: app
+        image: nginx:1.25
+      initContainers:
+      - name: init
+        image: busybox:1.36
+  expect:
+    size: 2
+
+- name: "badContainers catches :latest"
+  variable: badContainers
+  object:
+    spec:
+      containers:
+      - name: app
+        image: nginx:latest
+  expect:
+    size: 1
+    contains: "app uses image nginx:latest"
+
+- name: "badContainers catches untagged image"
+  variable: badContainers
+  object:
+    spec:
+      containers:
+      - name: app
+        image: nginx
+  expect:
+    size: 1
+    contains: "app uses image nginx"
+
+- name: "badContainers empty for properly tagged"
+  variable: badContainers
+  object:
+    spec:
+      containers:
+      - name: app
+        image: nginx:1.25
+      - name: sidecar
+        image: envoy:v1.28
+  expect:
+    value: []
+
+- name: "badContainers catches mix of good and bad"
+  variable: badContainers
+  object:
+    spec:
+      containers:
+      - name: good
+        image: nginx:1.25
+      - name: bad1
+        image: redis:latest
+      - name: bad2
+        image: postgres
+  expect:
+    size: 2
+
+# ---- Policy-level tests ----
+
+- name: "allows properly tagged images"
+  object:
+    metadata:
+      name: good-pod
+    spec:
+      containers:
+      - name: app
+        image: nginx:1.25
+      - name: sidecar
+        image: envoy:v1.28.0
+  expect:
+    allowed: true
+
+- name: "denies :latest tag"
+  object:
+    metadata:
+      name: bad-pod
+    spec:
+      containers:
+      - name: app
+        image: nginx:latest
+  expect:
+    allowed: false
+    messageContains: "app uses image nginx:latest"
+
+- name: "denies untagged image"
+  object:
+    metadata:
+      name: bad-pod
+    spec:
+      containers:
+      - name: app
+        image: nginx
+  expect:
+    allowed: false
+    messageContains: "app uses image nginx"
+
+- name: "denies latest in init container"
+  object:
+    metadata:
+      name: bad-pod
+    spec:
+      containers:
+      - name: app
+        image: nginx:1.25
+      initContainers:
+      - name: init
+        image: busybox:latest
+  expect:
+    allowed: false
+    messageContains: "init uses image busybox:latest"
