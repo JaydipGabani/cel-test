@@ -594,16 +594,26 @@ func ParseVAPPolicy(yamlContent string) (*VAPPolicy, error) { ... }
 // ParseVAPPolicyFile reads and parses a VAP policy YAML file.
 func ParseVAPPolicyFile(path string) (*VAPPolicy, error) { ... }
 
+// EvalVariable evaluates a single named variable from a policy, given input.
+// This evaluates preamble vars and all policy vars up to and including the target.
+// This enables per-variable testing — the primary value add over whole-policy testing.
+func (e *Evaluator) EvalVariable(policy *VAPPolicy, variableName string, input *AdmissionInput) (interface{}, error) { ... }
+
 // ========== Declarative Test Runner ==========
 
-// DiscoverAndRunTests walks srcRoot for *_test.cel files and runs them.
-// Uses Gatekeeper preamble variables (anyObject, params) and parameter wrapping.
-// For vanilla VAP / Kyverno / standalone expressions, use DiscoverAndRunTestsRaw.
-func DiscoverAndRunTests(t *testing.T, srcRoot string) { ... }
+// DiscoverAndRunTestsWithEvaluator walks srcRoot for *_test.cel files and runs
+// them using the provided evaluator with optional parameter wrapping.
+// This is the generic upstream runner — framework-specific variants like
+// DiscoverAndRunTests (Gatekeeper) are provided by downstream packages.
+func DiscoverAndRunTestsWithEvaluator(t *testing.T, eval *Evaluator, srcRoot string, wrapParams bool) { ... }
 
 // DiscoverAndRunTestsRaw walks srcRoot for *_test.cel files and runs them
 // without preamble variables or parameter wrapping.
 func DiscoverAndRunTestsRaw(t *testing.T, srcRoot string) { ... }
+
+// RunTestFileWithEvaluator runs a single test file with a custom evaluator.
+// This enables custom framework integration to reuse the declarative test runner.
+func RunTestFileWithEvaluator(t *testing.T, eval *Evaluator, testFilePath string, wrapParams bool) { ... }
 ```
 
 ### Framework Adaptation: Preamble Variables and Runner Variants
@@ -616,10 +626,13 @@ Policy frameworks like Gatekeeper and Kyverno inject runtime-computed variables 
 
 The declarative test runner provides two variants to handle these differences:
 
-| Runner | Preamble | Params | Use case |
-|---|---|---|---|
-| `DiscoverAndRunTests(t, root)` | Gatekeeper (`anyObject`, `params`) | Wrapped in `{spec: {parameters: ...}}` | gatekeeper-library `src/` |
-| `DiscoverAndRunTestsRaw(t, root)` | None | Passed as-is | Vanilla VAP, Kyverno, standalone expressions |
+| Runner | Location | Preamble | Params | Use case |
+|---|---|---|---|---|
+| `DiscoverAndRunTestsWithEvaluator(t, eval, root, wrap)` | upstream (`k8s.io/apiserver`) | Custom (via evaluator) | Configurable | Any framework |
+| `DiscoverAndRunTestsRaw(t, root)` | upstream | None | Passed as-is | Vanilla VAP, Kyverno, standalone |
+| `DiscoverAndRunTests(t, root)` | **downstream** (`kubernetes-sigs/cel-test`) | Gatekeeper (`anyObject`, `params`) | Wrapped | gatekeeper-library `src/` |
+
+> **Note**: `DiscoverAndRunTests` and `GatekeeperPreamble()` are framework-specific convenience functions that live in the downstream `kubernetes-sigs/cel-test` package, not in `k8s.io/apiserver`. The upstream package provides the generic `DiscoverAndRunTestsWithEvaluator` that any framework can use with its own evaluator.
 
 For custom frameworks, use `RunTestFileWithEvaluator` with a custom evaluator that has the framework's preamble variables set via `WithPreambleVariables`.
 
@@ -1021,9 +1034,74 @@ Evaluation errors show the test name, expression, and runtime error:
 #### Phase 2: CRD Validation Rules
 - `EvalCRDRule` with `self` / `oldSelf` variables
 - Schema-aware type checking (optional OpenAPI schema input)
-- `EvalCRDRule(expr string, input *CRDInput) (bool, string, error)`
 - Transition rule support (expressions referencing `oldSelf`)
-- **Note**: CRD env is built in `k8s.io/apiextensions-apiserver/pkg/apiserver/schema/cel/compilation.go` using `prepareEnvSet()` which extends base with `ScopedVarName`/`OldScopedVarName` and schema-derived `DeclType`
+- **Note**: CRD env is built in `k8s.io/apiextensions-apiserver/pkg/apiserver/schema/cel/compilation.go` using `prepareEnvSet()` which extends base with `ScopedVarName`/`OldScopedVarName` and schema-derived `DeclType`. The core building blocks (`SchemaDeclType`, `DeclTypeProvider`, `EnvSet.Extend`) already exist in `k8s.io/apiserver/pkg/cel` — no dependency on `apiextensions-apiserver` is needed.
+
+**CRD API sketch:**
+
+```go
+// CRDInput represents input for CRD x-kubernetes-validations rule evaluation.
+type CRDInput struct {
+    Self    map[string]interface{}  // → CEL `self` — current value at this schema node
+    OldSelf map[string]interface{}  // → CEL `oldSelf` — previous value (transition rules only, nil for create)
+}
+
+// CRDOption configures CRD evaluation.
+type CRDOption func(*crdConfig)
+
+// WithSchema provides an OpenAPI v3 schema for type-checked compilation.
+// Converts the schema to a CEL DeclType using apiservercel.SchemaDeclType(),
+// enabling compile-time type checking (e.g., `self.spec.replicas` fails if
+// the schema doesn't define `spec.replicas` as integer).
+// If omitted, `self`/`oldSelf` are declared as cel.DynType (untyped).
+func WithSchema(schema map[string]interface{}) CRDOption { ... }
+
+// WithTransitionRule marks this as a transition rule (oldSelf is available).
+// Without this option, `oldSelf` is not declared and referencing it is a compile error.
+func WithTransitionRule() CRDOption { ... }
+
+// EvalCRDRule evaluates a CRD x-kubernetes-validations rule.
+// Returns (allowed bool, message string, err error).
+//
+// Implementation:
+//   1. MustBaseEnvSet(ver) → base env
+//   2. If WithSchema: SchemaDeclType(schema, isResourceRoot) → DeclType
+//      Then: base.Extend(cel.Variable("self", declType.CelType()))
+//      Else: base.Extend(cel.Variable("self", cel.DynType))
+//   3. If WithTransitionRule: also Extend(cel.Variable("oldSelf", ...))
+//   4. Compile expression → Program → Eval({"self": input.Self, "oldSelf": input.OldSelf})
+func (e *Evaluator) EvalCRDRule(expr string, input *CRDInput, opts ...CRDOption) (bool, string, error) { ... }
+```
+
+**Declarative test format for CRD rules:**
+
+```yaml
+# replicas_test.cel
+mode: expression
+
+tests:
+- name: "replicas within limit"
+  expression: "self.spec.replicas <= self.spec.maxReplicas"
+  object:      # maps to `self` in CRD mode
+    spec:
+      replicas: 3
+      maxReplicas: 5
+  expect:
+    value: true
+
+- name: "transition rule — replicas cannot decrease"
+  expression: "self.spec.replicas >= oldSelf.spec.replicas"
+  object:      # → self
+    spec:
+      replicas: 5
+  oldObject:   # → oldSelf
+    spec:
+      replicas: 3
+  expect:
+    value: true
+```
+
+> **Variable aliasing**: In expression mode the runner maps `object` → `self` and `oldObject` → `oldSelf` when a `feature: crd` annotation is present (or when the expression references `self`/`oldSelf`). This lets CRD authors use natural variable names in tests while the test format stays consistent.
 
 #### Phase 3: DRA Device Selectors
 - `EvalDRASelector` with `device` variable (typed `DRADevice` object)
