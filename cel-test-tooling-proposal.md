@@ -1068,16 +1068,16 @@ Evaluation errors show the test name, expression, and runtime error:
 ### Open Questions for sig-api-machinery
 
 
-2. **Should AuthN's dual-env pattern (claims vs user) be modeled as two presets or one with a sub-option?**
+1. **Should AuthN's dual-env pattern (claims vs user) be modeled as two presets or one with a sub-option?**
    **Proposed: Two sub-methods on one evaluator** (`EvalAuthNClaims`, `EvalAuthNUser`) rather than two presets. This avoids preset proliferation.
 
-3. **How should CRD schema-typed `self`/`oldSelf` be handled — require OpenAPI schema input, or support untyped `DynType` for simpler testing?**
+2. **How should CRD schema-typed `self`/`oldSelf` be handled — require OpenAPI schema input, or support untyped `DynType` for simpler testing?**
    **Proposed: Support both.** Default to `DynType` for simplicity; optionally accept an OpenAPI schema for type-checked evaluation.
 
-4. **Should this package provide assertion helpers (`celtest.RequireAllowed(t, result)`) or keep it minimal?**
+3. **Should this package provide assertion helpers (`celtest.RequireAllowed(t, result)`) or keep it minimal?**
    **Proposed: Keep the core API minimal.** Assertion helpers (`celtest.RequireAllowed`) can be added in Phase 5 or by downstream projects.
 
-5. **What's the right level of cost tracking granularity to expose in test results?**
+4. **What's the right level of cost tracking granularity to expose in test results?**
    **Proposed: Expose total cost as `int64` on result types.** Per-expression cost breakdown is future work.
 
 ## Test Plan
