@@ -30,12 +30,26 @@ type (
 
 // Re-export upstream functions.
 var (
-	NewEvaluator         = celtest.NewEvaluator
-	WithVersion          = celtest.WithVersion
+	NewEvaluator          = celtest.NewEvaluator
+	WithVersion           = celtest.WithVersion
 	WithPreambleVariables = celtest.WithPreambleVariables
-	WithCostLimit        = celtest.WithCostLimit
-	GatekeeperPreamble   = celtest.GatekeeperPreamble
+	WithCostLimit         = celtest.WithCostLimit
 )
+
+// GatekeeperPreamble returns the standard Gatekeeper preamble variables.
+// This is Gatekeeper-specific and lives downstream, not in the upstream celtest package.
+func GatekeeperPreamble() []Variable {
+	return []Variable{
+		{
+			Name:       "anyObject",
+			Expression: `has(request.operation) && request.operation == "DELETE" && object == null ? oldObject : object`,
+		},
+		{
+			Name:       "params",
+			Expression: `!has(params.spec) ? null : !has(params.spec.parameters) ? null: params.spec.parameters`,
+		},
+	}
+}
 
 // ParseVAPPolicyFile reads and parses a VAP policy YAML file.
 // This is the YAML layer — the upstream celtest package doesn't include

@@ -123,20 +123,6 @@ func WithCostLimit(limit int64) Option {
 	}
 }
 
-// GatekeeperPreamble returns the standard Gatekeeper preamble variables.
-func GatekeeperPreamble() []Variable {
-	return []Variable{
-		{
-			Name:       "anyObject",
-			Expression: `has(request.operation) && request.operation == "DELETE" && object == null ? oldObject : object`,
-		},
-		{
-			Name:       "params",
-			Expression: `!has(params.spec) ? null : !has(params.spec.parameters) ? null: params.spec.parameters`,
-		},
-	}
-}
-
 // NewEvaluator creates a CEL evaluator using the real K8s upstream compiler.
 //
 // Uses admissioncel.NewCompositedCompiler — the same compiler the K8s API server
