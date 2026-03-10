@@ -1,0 +1,8 @@
+# Gatekeeper preamble: anyObject and params unwrapping
+version: "1.32"
+preamble:
+  variables:
+  - name: anyObject
+    expression: 'has(request.operation) && request.operation == "DELETE" && object == null ? oldObject : object'
+  - name: params
+    expression: '!has(params.spec) ? null : !has(params.spec.parameters) ? null : params.spec.parameters'

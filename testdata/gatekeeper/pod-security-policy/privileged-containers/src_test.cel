@@ -38,9 +38,11 @@ tests:
 - name: "exemptImagePrefixes extracts wildcard prefixes"
   variable: exemptImagePrefixes
   params:
-    exemptImages:
-    - "registry.k8s.io/*"
-    - "exact-image:latest"
+    spec:
+      parameters:
+        exemptImages:
+        - "registry.k8s.io/*"
+        - "exact-image:latest"
   object:
     spec:
       containers: []
@@ -51,9 +53,11 @@ tests:
 - name: "exemptImageExplicit extracts non-wildcard images"
   variable: exemptImageExplicit
   params:
-    exemptImages:
-    - "registry.k8s.io/*"
-    - "exact-image:latest"
+    spec:
+      parameters:
+        exemptImages:
+        - "registry.k8s.io/*"
+        - "exact-image:latest"
   object:
     spec:
       containers: []
@@ -99,8 +103,10 @@ tests:
 - name: "badContainers skips exempt image"
   variable: badContainers
   params:
-    exemptImages:
-    - "nginx"
+    spec:
+      parameters:
+        exemptImages:
+        - "nginx"
   object:
     spec:
       containers:
@@ -114,8 +120,10 @@ tests:
 - name: "badContainers skips wildcard exempt"
   variable: badContainers
   params:
-    exemptImages:
-    - "registry.k8s.io/*"
+    spec:
+      parameters:
+        exemptImages:
+        - "registry.k8s.io/*"
   object:
     spec:
       containers:
@@ -196,8 +204,10 @@ tests:
 
 - name: "allows exempt image even if privileged"
   params:
-    exemptImages:
-    - "registry.k8s.io/special:latest"
+    spec:
+      parameters:
+        exemptImages:
+        - "registry.k8s.io/special:latest"
   object:
     metadata:
       name: test-pod
@@ -212,8 +222,10 @@ tests:
 
 - name: "allows wildcard exempt image"
   params:
-    exemptImages:
-    - "registry.k8s.io/*"
+    spec:
+      parameters:
+        exemptImages:
+        - "registry.k8s.io/*"
   object:
     metadata:
       name: test-pod

@@ -1,0 +1,7 @@
+{
+  "gopls": {
+    "env": {
+      "GOFLAGS": "-mod=vendor"
+    }
+  }
+}
