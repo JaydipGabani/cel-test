@@ -32,9 +32,9 @@ import (
 	celconfig "k8s.io/apiserver/pkg/apis/cel"
 	"k8s.io/apiserver/pkg/cel/library"
 	genericfeatures "k8s.io/apiserver/pkg/features"
-	"k8s.io/apiserver/pkg/util/compatibility"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
-	basecompatibility "k8s.io/component-base/compatibility"
+	"k8s.io/component-base/featuregate"
+	utilversion "k8s.io/component-base/version"
 )
 
 // DefaultCompatibilityVersion returns a default compatibility version for use with EnvSet
@@ -50,14 +50,16 @@ import (
 // A default version number equal to the current Kubernetes major.minor version
 // indicates fast forward CEL features that can be used when rollback is no longer needed.
 func DefaultCompatibilityVersion() *version.Version {
-	effectiveVer := compatibility.DefaultComponentGlobalsRegistry.EffectiveVersionFor(basecompatibility.DefaultKubeComponent)
+	effectiveVer := featuregate.DefaultComponentGlobalsRegistry.EffectiveVersionFor(featuregate.DefaultKubeComponent)
 	if effectiveVer == nil {
-		effectiveVer = compatibility.DefaultBuildEffectiveVersion()
+		effectiveVer = utilversion.DefaultKubeEffectiveVersion()
 	}
 	return effectiveVer.MinCompatibilityVersion()
 }
 
-var baseOpts = []VersionedOptions{
+var baseOpts = append(baseOptsWithoutStrictCost, StrictCostOpt)
+
+var baseOptsWithoutStrictCost = []VersionedOptions{
 	{
 		// CEL epoch was actually 1.23, but we artificially set it to 1.0 because these
 		// options should always be present.
@@ -171,24 +173,9 @@ var baseOpts = []VersionedOptions{
 	{
 		IntroducedVersion: version.MajorMinor(1, 32),
 		EnvOptions: []cel.EnvOption{
-			ext.TwoVarComprehensions(),
+			UnversionedLib(ext.TwoVarComprehensions),
 		},
 	},
-	// Semver
-	{
-		IntroducedVersion: version.MajorMinor(1, 33),
-		EnvOptions: []cel.EnvOption{
-			library.SemverLib(library.SemverVersion(1)),
-		},
-	},
-	// List library
-	{
-		IntroducedVersion: version.MajorMinor(1, 34),
-		EnvOptions: []cel.EnvOption{
-			ext.Lists(ext.ListsVersion(3)),
-		},
-	},
-	StrictCostOpt,
 }
 
 var (
@@ -222,6 +209,7 @@ var cacheBaseEnvs = true
 func DisableBaseEnvSetCachingForTests() {
 	cacheBaseEnvs = false
 	baseEnvs.Clear()
+	baseEnvsWithOption.Clear()
 }
 
 // MustBaseEnvSet returns the common CEL base environments for Kubernetes for Version, or panics
@@ -233,7 +221,8 @@ func DisableBaseEnvSetCachingForTests() {
 // The returned environment contains no CEL variable definitions or custom type declarations and
 // should be extended to construct environments with the appropriate variable definitions,
 // type declarations and any other needed configuration.
-func MustBaseEnvSet(ver *version.Version) *EnvSet {
+// strictCost is used to determine whether to enforce strict cost calculation for CEL expressions.
+func MustBaseEnvSet(ver *version.Version, strictCost bool) *EnvSet {
 	if ver == nil {
 		panic("version must be non-nil")
 	}
@@ -242,23 +231,38 @@ func MustBaseEnvSet(ver *version.Version) *EnvSet {
 	}
 	key := strconv.FormatUint(uint64(ver.Major()), 10) + "." + strconv.FormatUint(uint64(ver.Minor()), 10)
 	var entry interface{}
-	if entry, ok := baseEnvs.Load(key); ok {
-		return entry.(*EnvSet)
-	}
-	entry, _, _ = baseEnvsSingleflight.Do(key, func() (interface{}, error) {
-		entry := mustNewEnvSet(ver, baseOpts)
-		if cacheBaseEnvs {
-			baseEnvs.Store(key, entry)
+	if strictCost {
+		if entry, ok := baseEnvs.Load(key); ok {
+			return entry.(*EnvSet)
 		}
-		return entry, nil
-	})
+		entry, _, _ = baseEnvsSingleflight.Do(key, func() (interface{}, error) {
+			entry := mustNewEnvSet(ver, baseOpts)
+			if cacheBaseEnvs {
+				baseEnvs.Store(key, entry)
+			}
+			return entry, nil
+		})
+	} else {
+		if entry, ok := baseEnvsWithOption.Load(key); ok {
+			return entry.(*EnvSet)
+		}
+		entry, _, _ = baseEnvsWithOptionSingleflight.Do(key, func() (interface{}, error) {
+			entry := mustNewEnvSet(ver, baseOptsWithoutStrictCost)
+			if cacheBaseEnvs {
+				baseEnvsWithOption.Store(key, entry)
+			}
+			return entry, nil
+		})
+	}
 
 	return entry.(*EnvSet)
 }
 
 var (
-	baseEnvs             = sync.Map{}
-	baseEnvsSingleflight = &singleflight.Group{}
+	baseEnvs                       = sync.Map{}
+	baseEnvsWithOption             = sync.Map{}
+	baseEnvsSingleflight           = &singleflight.Group{}
+	baseEnvsWithOptionSingleflight = &singleflight.Group{}
 )
 
 // UnversionedLib wraps library initialization calls like ext.Sets() or library.IP()
