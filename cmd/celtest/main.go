@@ -1,16 +1,16 @@
 package main
 
 import (
-"fmt"
-"os"
-"path/filepath"
-"reflect"
-"strings"
+	"fmt"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
 
-admissionv1 "k8s.io/api/admission/v1"
-"github.com/spf13/cobra"
-"gopkg.in/yaml.v3"
-celtest "k8s.io/apiserver/pkg/cel/testing/celtest"
+	"github.com/spf13/cobra"
+	"gopkg.in/yaml.v3"
+	admissionv1 "k8s.io/api/admission/v1"
+	celtest "k8s.io/apiserver/pkg/cel/testing/celtest"
 )
 
 func main() {
