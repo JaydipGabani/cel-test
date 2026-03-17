@@ -106,7 +106,7 @@ The package lives in `k8s.io/apiserver`, which is a large module. Users who only
 
 **Risk: Environment drift between test package and production.**
 If the test package constructs its CEL environment differently from the real admission/CRD/DRA code paths, tests could pass but production could fail.
-*Mitigation:* The evaluator reuses upstream K8s code at two levels:
+*Mitigation:* The evaluator reuses upstream K8s code across the following layers:
 
 | Layer | Upstream code reused | Fidelity | Notes |
 |---|---|---|---|
@@ -130,6 +130,20 @@ If a user pins `WithVersion(1, 28)` but the package ships with K8s 1.33, the bas
 *Mitigation:* `environment.MustBaseEnvSet(version)` is designed specifically for this. It accepts a compatibility version and only enables libraries and features available at that version. This is the same mechanism the K8s API server uses for rollback safety (`DefaultCompatibilityVersion()`). The test package delegates entirely to this function, so version pinning inherits the same backward compatibility guarantees as the API server itself.
 
 > **Important caveat:** Version pinning controls which CEL libraries are *available* in the environment, not which *implementation* of those libraries runs. The library code comes from the Go binary you built against (e.g., K8s 1.33), not from K8s 1.28. If a library's behavior changed between 1.28 and 1.33 (e.g., a bug fix or semantic change), `WithVersion(1, 28)` running on a 1.33 binary will still use the 1.33 implementation of that library. This is the same guarantee the API server itself provides during rollback — no more, no less.
+
+### Behavioral Details
+
+**Thread safety and `t.Parallel()` support.**
+The `Evaluator` is safe for concurrent use from multiple goroutines. Compilation results are cached in a `sync.Mutex`-protected `compilationCache` map, so parallel Go subtests (`t.Parallel()`) sharing the same `Evaluator` instance work correctly without external synchronization. The cache is keyed by expression text, so identical expressions compiled from different test cases hit the cache. Environment construction (`NewEvaluator`) is not concurrent — create the evaluator once and share it across parallel tests.
+
+**Preamble variable compilation failures.**
+Preamble variables are compiled lazily at first evaluation, not eagerly at `NewEvaluator()` construction time. If a preamble variable’s CEL expression fails to compile (e.g., syntax error), the failure surfaces as an error from `EvalAdmission()` or `EvalVariable()` at call time, not at evaluator construction. This is consistent with how the production admission pipeline handles compilation.
+
+**Missing companion policy file.**
+If a `*_test.cel` file has no `mode:` field (defaults to `mode: policy`) and no companion `*.cel` file exists in the same directory, the test runner calls `t.Fatalf()` with a descriptive error: `"loading companion policy <path>: open <path>: no such file or directory"`. The runner does not silently skip the file or fall back to expression mode.
+
+**Parameter wrapping (`wrapParams`).**
+The `DiscoverAndRunTestsWithEvaluator` function accepts a `wrapParams bool` parameter. When `true`, the runner automatically wraps `params` from test cases inside `{"spec": {"parameters": <params>}}` before evaluation — matching the Gatekeeper constraint CRD structure. This is a convenience for frameworks that expect parameters nested inside a CRD wrapper. When `false` (and in `DiscoverAndRunTestsRaw`), params are passed as-is.
 
 ## Design Details
 
@@ -178,7 +192,7 @@ A new testing sub-package in apiserver staging. This is the core deliverable of 
 | `evaluator.go` | `Evaluator` struct, `NewEvaluator()`, `EvalAdmission()`, `EvalExpression()`, `EvalVariable()`, `CompileCheck()`, `WithVersion()`, `WithPreambleVariables()`, `WithCostLimit()` | ~300 |
 | `parse.go` | `ParseVAPPolicy()`, `ParseVAPPolicyFile()`, `ParsePolicySource()` — YAML parsing for both the lightweight `variables:` / `validations:` format AND native K8s admission resource YAML (`ValidatingAdmissionPolicy`, `MutatingAdmissionPolicy` — auto-detected via `apiVersion`/`kind` fields) | ~180 |
 | `runner.go` | `DiscoverAndRunTestsRaw()`, `DiscoverAndRunTestsWithEvaluator()`, `RunTestFileWithEvaluator()` — declarative `*_test.cel` test runner | ~350 |
-| `types.go` | `AdmissionInput`, `AdmissionResult`, `Violation`, `VAPPolicy` (using `admissionregistrationv1.Variable` and `admissionregistrationv1.Validation` from `k8s.io/api`) | ~50 |
+| `types.go` | `AdmissionInput`, `AdmissionResult`, `Violation`, `VAPPolicy`, `Variable`, `Validation` | ~50 |
 
 #### Modifications to existing package: `k8s.io/apiserver/pkg/admission/plugin/cel`
 
@@ -188,19 +202,9 @@ The test package needs helpers that mirror unexported internal functions. These 
 |---|---|---|
 | `testing_helpers.go` (new) | Export `CreateTestEnv(baseEnv, opts)` — a thin wrapper that delegates to the unexported `createEnvForOpts()` in the same package (not a mirror/reimplementation). Also exports `TestActivation` struct implementing `interpreter.Activation` for evaluating from unstructured inputs. | The production `createEnvForOpts()` is unexported and `evaluationActivation` requires `admission.VersionedAttributes` which can't be constructed from test input. Since `testing_helpers.go` lives in the same package, `CreateTestEnv()` calls `createEnvForOpts()` directly — full fidelity, no drift risk. The unexported `hasPatchTypes` extension is also applied via this delegation. A unit test (`TestCreateTestEnvEquivalence`) asserts that `CreateTestEnv()` produces an environment equivalent to the one produced by the production `mustBuildEnvs()` path, so any refactoring of internal functions is caught immediately. |
 
-**`TestActivation.ResolveName()` conversion specification:**
+**`TestActivation.ResolveName()` conversion semantics:**
 
-`TestActivation` replicates the exact conversion semantics of the production `evaluationActivation.ResolveName()` in [activation.go](https://github.com/kubernetes/kubernetes/blob/master/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/activation.go). Since `TestActivation` lives in the same package, it can call the unexported `objectToResolveVal()` directly — no reimplementation needed.
-
-| Input field | nil behavior | non-nil conversion | Production equivalent |
-|---|---|---|---|
-| `Object` | `types.NullValue` | `objectToResolveVal(obj)` → `types.NewUnstructured(types.NewObjectType(""), obj)` | Same — calls `objectToResolveVal()` directly |
-| `OldObject` | `types.NullValue` | `objectToResolveVal(oldObj)` | Same |
-| `Params` | `types.NullValue` | `objectToResolveVal(params)` | Same |
-| `Request` | Never nil (default applied before activation) | `objectToResolveVal(request)` | Same |
-| `Namespace` | `types.NullValue` | Round-trip: `runtime.DefaultUnstructuredConverter.FromUnstructured(ns)` → `*v1.Namespace` → `CreateNamespaceObject(ns)` (applies field filtering) → `runtime.DefaultUnstructuredConverter.ToUnstructured(filtered)` → `objectToResolveVal(result)` | Production calls `CreateNamespaceObject()` on the typed `*v1.Namespace` from the admission pipeline, then passes through `objectToResolveVal()`. The test path reconstructs this by round-tripping through the typed representation. |
-
-Because `TestActivation` lives in the same Go package as `objectToResolveVal()` and `CreateNamespaceObject()`, it calls both directly — **zero reimplementation, zero drift risk**. A unit test (`TestActivationEquivalence`) asserts that `TestActivation.ResolveName()` produces identical `ref.Val` values as the production `evaluationActivation` for the same inputs.
+`TestActivation` replicates the exact conversion semantics of the production `evaluationActivation.ResolveName()` in [activation.go](https://github.com/kubernetes/kubernetes/blob/master/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/activation.go). Since `TestActivation` lives in the same package, it calls the unexported `objectToResolveVal()` and `CreateNamespaceObject()` directly — **zero reimplementation, zero drift risk**. The full per-field conversion specification (nil behavior, non-nil conversion, production equivalence) is documented in `testing_helpers.go` code comments. A unit test (`TestActivationEquivalence`) asserts that `TestActivation.ResolveName()` produces identical `ref.Val` values as the production `evaluationActivation` for the same inputs.
 | `compile.go` | No changes. `BuildRequestType()`, `BuildNamespaceType()`, and `OptionalVariableDeclarations` are already exported. The unexported `createEnvForOpts()` and `hasPatchTypes` are accessed from `testing_helpers.go` in the same package. | Already usable as-is. |
 
 **Upstream export requirements:** `CreateTestEnv()` and `TestActivation` are the only new exports required in existing production packages. All other functions the test package needs (`BuildRequestType`, `BuildNamespaceType`, `MustBaseEnvSet`, `NewCompositedCompilerForTypeChecking`, `CreateNamespaceObject`, etc.) are already exported.
@@ -215,7 +219,7 @@ This design has two deliverables that follow established Kubernetes contribution
 
 **1. Go library → `k8s.io/apiserver/pkg/cel/testing/celtest`**
 
-The core Go API (`NewAdmissionEvaluator`, `EvalExpression`, `CompileCheck`, `WithPreambleVariables`) lives in `k8s.io/apiserver` staging. This follows the precedent of other testing packages in the K8s tree:
+The core Go API (`NewEvaluator`, `EvalExpression`, `CompileCheck`, `WithPreambleVariables`) lives in `k8s.io/apiserver` staging. This follows the precedent of other testing packages in the K8s tree:
 
 | Existing package | What it provides |
 |---|---|
@@ -249,7 +253,7 @@ Commands:
 
 ### Testing Levels
 
-The tooling supports three levels of testing, each addressing a different need:
+The tooling supports four levels of testing, each addressing a different need:
 
 | Level | API | What it tests | Who needs it |
 |---|---|---|---|
@@ -523,30 +527,30 @@ import (
     "k8s.io/apimachinery/pkg/util/version"
 )
 
-// AdmissionEvaluator compiles and evaluates admission-style CEL expressions
-// (VAP, MAP, matchConditions) using the real K8s environment.
+// Evaluator compiles and evaluates CEL expressions using the real K8s
+// CEL environment (environment.MustBaseEnvSet). It supports version-pinning,
+// preamble variables (for framework injection), and admission-style evaluation.
 //
-// Each Kubernetes CEL context has a fundamentally different environment (different
-// variables, types, and compilation pipeline). Rather than a single god-object
-// Evaluator with 7+ Eval* methods, each context gets its own evaluator type
-// sharing a common base environment:
+// Phase 1 focuses on admission-style CEL (VAP, MAP, matchConditions).
+// Future phases will extend the evaluator or introduce feature-specific
+// evaluator types for other CEL contexts:
 //
-//   - AdmissionEvaluator (Phase 1): VAP, MAP, matchConditions
+//   - Evaluator (Phase 1): VAP, MAP, matchConditions
 //   - CRDEvaluator (Phase 2, separate KEP): CRD x-kubernetes-validations
 //   - DRAEvaluator (Phase 3, separate KEP): DRA device selectors
 //   - AuthNEvaluator / AuthZEvaluator (Phase 4, separate KEP): AuthN/AuthZ
 //
 // All evaluators share environment.MustBaseEnvSet(ver) and WithVersion semantics.
-// This KEP defines only AdmissionEvaluator. Future evaluators will be designed
+// This KEP defines only Evaluator. Future evaluators will be designed
 // in their respective KEPs with input from the teams that own those features.
-type AdmissionEvaluator struct {
+type Evaluator struct {
     envSet           *environment.EnvSet
     version          *version.Version
     preambleVars     []Variable  // framework-injected variables evaluated before policy variables
 }
 
-// Option configures an AdmissionEvaluator.
-type Option func(*AdmissionEvaluator)
+// Option configures an Evaluator.
+type Option func(*Evaluator)
 
 // WithVersion sets the K8s compatibility version (default: latest).
 func WithVersion(major, minor uint) Option { ... }
@@ -557,7 +561,7 @@ func WithVersion(major, minor uint) Option { ... }
 // jsonPatch.escape(). By default, the MAP extension is enabled.
 func WithoutPatchTypes() Option { ... }
 
-// NewAdmissionEvaluator creates an evaluator for admission-style CEL expressions
+// NewEvaluator creates an evaluator for admission-style CEL expressions
 // (VAP, MAP, matchConditions). Internally calls environment.MustBaseEnvSet() and
 // extends with admission-style variables and types via CreateTestEnv(), which
 // delegates to the unexported createEnvForOpts() in the same package.
@@ -565,7 +569,7 @@ func WithoutPatchTypes() Option { ... }
 // The environment includes the MAP extension by default (HasPatchTypes: true).
 // Use WithoutPatchTypes() to restrict the environment to pure VAP/matchConditions.
 // MAP mutation *application* (patching objects) is not supported.
-func NewAdmissionEvaluator(opts ...Option) (*AdmissionEvaluator, error) { ... }
+func NewEvaluator(opts ...Option) (*Evaluator, error) { ... }
 
 // ========== VAP / MAP / matchConditions ==========
 
@@ -580,74 +584,48 @@ func NewAdmissionEvaluator(opts ...Option) (*AdmissionEvaluator, error) { ... }
 //   | Object               | object                  | DynType                            | nil (null in CEL)                                |
 //   | OldObject            | oldObject               | DynType                            | nil (null in CEL)                                |
 //   | Params               | params                  | DynType                            | nil (null in CEL)                                |
-//   | Request              | request                 | kubernetes.AdmissionRequest        | DefaultAdmissionRequest (see below)              |
+//   | Request              | request                 | kubernetes.AdmissionRequest        | Minimal request with Operation="CREATE"           |
 //   | Namespace            | namespaceObject         | kubernetes.Namespace               | nil (null in CEL)                                |
 //
-// All fields are map[string]interface{} — the unstructured representation of K8s
-// objects, matching the runtime behavior of the API server which converts typed
-// objects to unstructured before CEL evaluation.
+// Request and Namespace use typed Go structs (*admissionv1.AdmissionRequest and
+// *corev1.Namespace respectively) rather than raw maps. The evaluator internally
+// converts these to unstructured maps for CEL binding, matching the production
+// API server's conversion path. This provides compile-time type safety for test
+// authors while maintaining evaluation fidelity.
 //
-// Request defaults to DefaultAdmissionRequest if nil. The default populates all
-// top-level fields matching the structure of a real kubernetes.AdmissionRequest,
-// ensuring that expressions accessing request.userInfo, request.namespace,
-// request.kind, etc. work without error — matching production behavior where
-// these fields always exist (even if empty). Users override only the fields
-// they care about.
-//
-// var DefaultAdmissionRequest = map[string]interface{}{
-//     "operation": "CREATE",
-//     "kind":      map[string]interface{}{"group": "", "version": "v1", "kind": ""},
-//     "resource":  map[string]interface{}{"group": "", "version": "v1", "resource": ""},
-//     "requestKind":     map[string]interface{}{"group": "", "version": "v1", "kind": ""},
-//     "requestResource": map[string]interface{}{"group": "", "version": "v1", "resource": ""},
-//     "name":      "",
-//     "namespace": "default",
-//     "userInfo":  map[string]interface{}{"username": "", "uid": "", "groups": []interface{}{}, "extra": map[string]interface{}{}},
-//     "dryRun":    false,
-//     "options":   map[string]interface{}{},
-// }
-//
-// When AdmissionInput.Request is non-nil, the provided map is **merged** onto
-// DefaultAdmissionRequest — user-specified fields take precedence, unspecified
-// fields retain their defaults. This means `Request: map[string]interface{}
-// {"operation": "UPDATE"}` produces a full request object with operation=UPDATE
-// and all other fields at their defaults.
-//
-// Namespace should follow the structure produced by CreateNamespaceObject()
-// (metadata with name/labels/annotations, spec, status). If nil, the
-// namespaceObject CEL variable resolves to null.
+// If Request is nil, a minimal *admissionv1.AdmissionRequest with
+// Operation="CREATE" is synthesized. If Namespace is nil, the namespaceObject
+// CEL variable resolves to null.
 //
 // authorizer and authorizer.requestResource are not declared in Phase 1.
 // Expressions referencing `authorizer` will fail at compile time with an
 // "undeclared reference" error. Mock authorizer support will be added in
 // Phase 5 via a `WithAuthorizer(mock)` option.
 type AdmissionInput struct {
-    Object    map[string]interface{}  // → CEL `object` (DynType)
-    OldObject map[string]interface{}  // → CEL `oldObject` (DynType)
-    Params    map[string]interface{}  // → CEL `params` (DynType)
-    Request   map[string]interface{}  // → CEL `request` (kubernetes.AdmissionRequest). Default: DefaultAdmissionRequest (merged)
-    Namespace map[string]interface{}  // → CEL `namespaceObject` (kubernetes.Namespace)
+    Object    map[string]interface{}            // → CEL `object` (DynType)
+    OldObject map[string]interface{}            // → CEL `oldObject` (DynType)
+    Params    map[string]interface{}            // → CEL `params` (DynType)
+    Request   *admissionv1.AdmissionRequest     // → CEL `request` (kubernetes.AdmissionRequest). Default: Operation="CREATE"
+    Namespace *corev1.Namespace                 // → CEL `namespaceObject` (kubernetes.Namespace). Default: nil (null)
 }
 
 // VAPPolicy represents a parsed VAP-style policy (variables + validations).
 type VAPPolicy struct {
-    Variables   []admissionregistrationv1.Variable
-    Validations []admissionregistrationv1.Validation
+    Variables   []Variable
+    Validations []Validation
 }
 
 // AdmissionResult holds the evaluation outcome.
 type AdmissionResult struct {
-    Allowed       bool
-    Violations    []Violation
-    Cost          int64                // total CEL evaluation cost (shared budget, sum of all expressions)
-    CostBreakdown map[string]int64     // per-expression cost: key is expression text or "var:<name>" for variables
+    Allowed    bool
+    Violations []Violation
+    Cost       int64  // total CEL evaluation cost in K8s cost units
 }
 
 type Violation struct {
     Expression string
     Message    string
     Error      error
-    Cost       int64  // CEL cost consumed by this expression's evaluation
 }
 
 > Cost tracking uses the same `cel.OptTrackCost` and `PerCallLimit` as the K8s API server. The `Cost` field reports the total CEL evaluation cost in K8s cost units. This helps policy authors detect expressions that may exceed the runtime cost budget before deploying to a cluster. The `AdmissionResult.Cost` field and `WithCostLimit` option are defined in Phase 1a; cost tracking implementation ships in Phase 1a with the default of no limit (cost is reported but never causes failures).
@@ -665,11 +643,11 @@ type Violation struct {
 // runtimeCELCostBudget is decremented across all expressions in a single
 // admission evaluation.
 //
-// Default: no limit (cost is tracked and reported in AdmissionResult.Cost and
-// AdmissionResult.CostBreakdown but never causes failures).
+// Default: no limit (cost is tracked and reported in AdmissionResult.Cost
+// but never causes failures).
 //
 // Use celtest.PerCallLimit for the K8s production limit:
-//   eval, _ := celtest.NewAdmissionEvaluator(celtest.WithCostLimit(celtest.PerCallLimit))
+//   eval, _ := celtest.NewEvaluator(celtest.WithCostLimit(celtest.PerCallLimit))
 //
 // The K8s production limit is defined in k8s.io/apiserver/pkg/apis/cel/config.go.
 func WithCostLimit(limit int64) Option { ... }
@@ -679,12 +657,12 @@ func WithCostLimit(limit int64) Option { ... }
 const PerCallLimit = celconfig.PerCallLimit  // currently 1,000,000 (from k8s.io/apiserver/pkg/apis/cel)
 
 // EvalAdmission evaluates a VAP/MAP/matchCondition policy against admission input.
-func (e *AdmissionEvaluator) EvalAdmission(policy *VAPPolicy, input *AdmissionInput) (*AdmissionResult, error) { ... }
+func (e *Evaluator) EvalAdmission(policy *VAPPolicy, input *AdmissionInput) (*AdmissionResult, error) { ... }
 
 // ========== Future Feature-Specific Evaluators ==========
 //
 // Future CEL contexts (CRD, DRA, AuthN/AuthZ) will get their own evaluator types
-// in separate KEPs — see AdmissionEvaluator doc comment above for the planned list.
+// in separate KEPs — see Evaluator doc comment above for the planned list.
 // In the meantime, EvalExpression() provides basic testing for any CEL expression
 // using the admission-style environment with DynType variables.
 
@@ -708,7 +686,7 @@ func (e *AdmissionEvaluator) EvalAdmission(policy *VAPPolicy, input *AdmissionIn
 //           "variables.containers": []interface{}{...},
 //       },
 //   )
-func (e *AdmissionEvaluator) EvalExpression(expr string, input *AdmissionInput, extraVars map[string]interface{}) (interface{}, error) { ... }
+func (e *Evaluator) EvalExpression(expr string, input *AdmissionInput, extraVars map[string]interface{}) (interface{}, error) { ... }
 
 // CompileCheck validates that a CEL expression compiles without errors.
 // Uses the NewExpressions environment mode, which restricts available libraries
@@ -732,7 +710,7 @@ func (e *AdmissionEvaluator) EvalExpression(expr string, input *AdmissionInput, 
 // > This is intentional and matches the API server's dual-mode behavior: new
 // > expressions are validated strictly, while already-stored expressions are
 // > evaluated permissively for rollback safety.
-func (e *AdmissionEvaluator) CompileCheck(expr string) error { ... }
+func (e *Evaluator) CompileCheck(expr string) error { ... }
 
 // ParseVAPPolicy parses a VAP policy from the lightweight YAML format
 // (top-level variables: / validations: keys, no apiVersion/kind).
@@ -759,13 +737,15 @@ func ParsePolicySourceFile(path string) (*VAPPolicy, error) { ... }
 // EvalVariable evaluates a single named variable from a policy, given input.
 // This evaluates preamble vars and all policy vars up to and including the target.
 // This enables per-variable testing — the primary value add over whole-policy testing.
-func (e *AdmissionEvaluator) EvalVariable(policy *VAPPolicy, variableName string, input *AdmissionInput) (interface{}, error) { ... }
+func (e *Evaluator) EvalVariable(policy *VAPPolicy, variableName string, input *AdmissionInput) (interface{}, error) { ... }
 
 // ========== Declarative Test Runner ==========
 
 // DiscoverAndRunTestsWithEvaluator walks srcRoot for *_test.cel files and runs
-// them using the provided evaluator.
-func DiscoverAndRunTestsWithEvaluator(t *testing.T, eval *AdmissionEvaluator, srcRoot string) { ... }
+// them using the provided evaluator. wrapParams controls whether test case params
+// are automatically wrapped in {"spec": {"parameters": <params>}} for frameworks
+// like Gatekeeper that expect this structure.
+func DiscoverAndRunTestsWithEvaluator(t *testing.T, eval *Evaluator, srcRoot string, wrapParams bool) { ... }
 
 // DiscoverAndRunTestsRaw walks srcRoot for *_test.cel files and runs them
 // without preamble variables.
@@ -773,7 +753,7 @@ func DiscoverAndRunTestsRaw(t *testing.T, srcRoot string) { ... }
 
 // RunTestFileWithEvaluator runs a single test file with a custom evaluator.
 // This enables custom framework integration to reuse the declarative test runner.
-func RunTestFileWithEvaluator(t *testing.T, eval *AdmissionEvaluator, testFilePath string) { ... }
+func RunTestFileWithEvaluator(t *testing.T, eval *Evaluator, testFilePath string, wrapParams bool) { ... }
 ```
 
 ### Framework Adaptation: Preamble Variables and Runner Variants
@@ -877,8 +857,8 @@ Use `WithPreambleVariables` to replicate this:
 
 ```go
 // Reusable Gatekeeper evaluator — create once, use for all policies
-func newGatekeeperEvaluator() (*celtest.AdmissionEvaluator, error) {
-    return celtest.NewAdmissionEvaluator(
+func newGatekeeperEvaluator() (*celtest.Evaluator, error) {
+    return celtest.NewEvaluator(
         celtest.WithPreambleVariables(
             // Gatekeeper's BindObjectV1Beta1: unified object access
             celtest.Variable{
@@ -937,7 +917,7 @@ func TestPrivilegedContainers(t *testing.T) {
 #### Per-Expression Table Test
 ```go
 func TestFilterExpression(t *testing.T) {
-    eval, _ := celtest.NewAdmissionEvaluator()
+    eval, _ := celtest.NewEvaluator()
     tests := []struct {
         name   string
         expr   string
@@ -1190,7 +1170,7 @@ Evaluation errors show the test name, expression, and runtime error:
 ### Implementation Plan
 
 #### Phase 1a: Core Go Library (MVP)
-- `NewAdmissionEvaluator` with admission-style environment including MAP extension (`HasPatchTypes: true` by default — enables `library.JSONPatch` and `mutation.DynamicTypeResolver`)
+- `NewEvaluator` with admission-style environment including MAP extension (`HasPatchTypes: true` by default — enables `library.JSONPatch` and `mutation.DynamicTypeResolver`)
 - `EvalAdmission` for full VAP/MAP policy evaluation (validations returning allowed/denied)
 - `EvalExpression` for single expression testing (including MAP mutation expressions — returns raw CEL value)
 - `CompileCheck` for compilation validation (including MAP expressions like `jsonPatch.escape()`)
@@ -1206,97 +1186,19 @@ Evaluation errors show the test name, expression, and runtime error:
 Wraps the upstream Go library in a standalone CLI. See [CLI Tool Design](#cli-tool-design) for commands, flags, output formats, and configuration. Installable via `go install sigs.k8s.io/cel-test/cmd/celtest@latest`.
 
 #### Phase 2: CRD Validation Rules (separate follow-up KEP)
-- `CRDEvaluator` with `EvalRule()` method, `self` / `oldSelf` variables
-- Schema-aware type checking (**required** OpenAPI schema input — schema-typed `self` is the primary value of CRD validation testing; untyped testing is already available via `EvalExpression`)
-- Transition rule support (expressions referencing `oldSelf`)
-- **Note**: CRD env is built in `k8s.io/apiextensions-apiserver/pkg/apiserver/schema/cel/compilation.go` using `prepareEnvSet()` which extends base with `ScopedVarName`/`OldScopedVarName` and schema-derived `DeclType`. The low-level building blocks (`SchemaDeclType`, `DeclTypeProvider`, `EnvSet.Extend`) exist in `k8s.io/apiserver/pkg/cel`, but the full CRD compilation pipeline in `apiextensions-apiserver` includes substantial additional logic: `x-kubernetes-*` extension handling (`int-or-string`, `preserve-unknown-fields`, `embedded-resource`), recursive schema cycle detection, cost estimation parameterized by schema constraints (`maxLength`, `maxItems`), and multiversion schema compilation. A CRD evaluator will need to either take a dependency on `apiextensions-apiserver` or reimplement this logic — this trade-off will be resolved in the Phase 2 KEP.
-- **Scope note**: Phase 2 will be proposed as a separate KEP with its own `CRDEvaluator` type. The API sketch below is provided for directional context only.
-
-**CRD API sketch:**
-
-```go
-// CRDInput represents input for CRD x-kubernetes-validations rule evaluation.
-type CRDInput struct {
-    Self    map[string]interface{}  // → CEL `self` — current value at this schema node
-    OldSelf map[string]interface{}  // → CEL `oldSelf` — previous value (transition rules only, nil for create)
-}
-
-// CRDOption configures CRD evaluation.
-type CRDOption func(*crdConfig)
-
-// WithSchema provides an OpenAPI v3 schema for type-checked compilation (required).
-// Converts the schema to a CEL DeclType using apiservercel.SchemaDeclType(),
-// enabling compile-time type checking (e.g., `self.spec.replicas` fails if
-// the schema doesn't define `spec.replicas` as integer).
-// CRD authors already have the schema in their CRD YAML; this ensures test
-// fidelity matches production. For untyped/quick testing without a schema,
-// use EvalExpression() with the admission environment instead.
-func WithSchema(schema map[string]interface{}) CRDOption { ... }
-
-// WithTransitionRule marks this as a transition rule (oldSelf is available).
-// Without this option, `oldSelf` is not declared and referencing it is a compile error.
-func WithTransitionRule() CRDOption { ... }
-
-// EvalCRDRule evaluates a CRD x-kubernetes-validations rule.
-// Returns (allowed bool, message string, err error).
-// WithSchema is required — returns an error if no schema is provided.
-//
-// Implementation:
-//   1. MustBaseEnvSet(ver) → base env
-//   2. SchemaDeclType(schema, isResourceRoot) → DeclType
-//      Then: base.Extend(cel.Variable("self", declType.CelType()))
-//   3. If WithTransitionRule: also Extend(cel.Variable("oldSelf", ...))
-//   4. Compile expression → Program → Eval({"self": input.Self, "oldSelf": input.OldSelf})
-func (e *CRDEvaluator) EvalRule(expr string, input *CRDInput, opts ...CRDOption) (bool, string, error) { ... }
-```
-
-**Declarative test format for CRD rules:**
-
-```yaml
-# replicas_test.cel
-mode: expression
-feature: crd          # Selects CRD environment; maps object → self, oldObject → oldSelf
-
-tests:
-- name: "replicas within limit"
-  expression: "self.spec.replicas <= self.spec.maxReplicas"
-  object:      # maps to `self` when feature: crd
-    spec:
-      replicas: 3
-      maxReplicas: 5
-  expect:
-    value: true
-
-- name: "transition rule — replicas cannot decrease"
-  expression: "self.spec.replicas >= oldSelf.spec.replicas"
-  object:      # → self
-    spec:
-      replicas: 5
-  oldObject:   # → oldSelf
-    spec:
-      replicas: 3
-  expect:
-    value: true
-```
-
-> **Variable aliasing**: When `feature: crd` is set, the runner maps `object` → `self` and `oldObject` → `oldSelf`. This lets CRD authors use consistent test input field names while the runner binds them to the correct CRD variables. No auto-detection by expression content is performed — the `feature:` field must be set explicitly.
+- `CRDEvaluator` with `EvalRule()` method, `self` / `oldSelf` variables, required OpenAPI schema input
+- Schema-aware type checking and transition rule support
+- CRD env is built in `k8s.io/apiextensions-apiserver` via `prepareEnvSet()` — whether the evaluator takes a dependency on that module or reimplements will be resolved in the Phase 2 KEP
 
 #### Phase 3: DRA Device Selectors (separate follow-up KEP)
-- `DRAEvaluator` with `EvalSelector()` method, `device` variable (typed `DRADevice` object)
-- `EvalSelector` returning `(bool, error)`
-- Map-with-default behavior for attribute/capacity lookups (matching `newStringInterfaceMapWithDefault`)
-- **Note**: DRA's unique aspects are the `DRADevice` typed object and `ext.Bindings(ext.BindingsVersion(0))` from `k8s.io/dynamic-resource-allocation/cel`, plus the custom `mapper` that returns empty maps for unknown attribute domains. The `DRADevice` type is versioned: `deviceTypeV131` has `.driver`, `.attributes`, `.capacity`; `deviceTypeV134ConsumableCapacity` adds `.allowMultipleAllocations` (bool) behind the `ConsumableCapacity` feature gate. The `DRAEvaluator` will need to handle this version/feature-gate interaction. (`Semver` is already in the base env since 1.33 — see features table.)
+- `DRAEvaluator` with `EvalSelector()` method, typed `DRADevice` variable
+- Lives in `k8s.io/dynamic-resource-allocation/cel/testing` due to cross-module boundary
 
 #### Phase 4: Authentication & Authorization (separate follow-up KEP)
-- `AuthNClaimsEvaluator` and `AuthNUserEvaluator` with dual envs: `claims` (map) and `user` (typed UserInfo)
-- `AuthZEvaluator` with typed `SubjectAccessReviewSpec` including optional `fieldSelector`/`labelSelector`
-- Separate evaluator types following the per-feature pattern
-- **Note**: AuthN uses two separate `EnvSet` instances (`mustBuildEnvs()` in `authentication/cel/compile.go`) keyed by variable name: `"claims"` env (variable `claims` typed `map(string, any)`) and `"user"` env (variable `user` typed `kubernetes.UserInfo` with fields: username, uid, groups, extra). AuthZ uses a single env with `request` typed as `kubernetes.SubjectAccessReviewSpec`. AuthZ includes AST analysis (`celast.PreOrderVisit`) for field/label selector usage detection, stored in `CompilationResult.UsesFieldSelector`/`UsesLabelSelector`.
+- `AuthNClaimsEvaluator`, `AuthNUserEvaluator`, `AuthZEvaluator` — separate evaluator types following the per-feature pattern
 
 #### Phase 5: Advanced Features
-- Authorizer mock support for `authorizer` / `authorizer.requestResource` variables
-- `testing.T` integration helpers (`celtest.Assert`, `celtest.RequireAllowed`, etc.)
-- Benchmark support for expression cost comparison
+- Authorizer mock support, `testing.T` assertion helpers, benchmark support for cost comparison
 
 ### Graduation Criteria
 
@@ -1309,7 +1211,7 @@ tests:
 - Unit tests cover admission evaluation, version pinning, and preamble variable ordering
 
 #### Beta
-- `AdmissionEvaluator` API stable for VAP/MAP/matchConditions
+- `Evaluator` API stable for VAP/MAP/matchConditions
 - Declarative `*_test.cel` format with `DiscoverAndRunTestsWithEvaluator` / `DiscoverAndRunTestsRaw` runners
 - CLI supports admission-style evaluation with all output formats (text, JSON, JUnit)
 - Adopted by at least 1 external project (e.g., gatekeeper-library) for CEL policy testing
@@ -1317,7 +1219,7 @@ tests:
 
 #### GA (Stable)
 - Adopted by 2+ projects outside of gatekeeper-library
-- `AdmissionEvaluator` API stable with no breaking changes for 2 K8s releases
+- `Evaluator` API stable with no breaking changes for 2 K8s releases
 - Cost tracking matches production behavior
 - Documentation published on kubernetes.io
 
@@ -1346,7 +1248,7 @@ tests:
 
 Unit tests for the `celtest` package itself will cover:
 
-- **Admission environment construction**: `NewAdmissionEvaluator` creates the correct admission CEL environment with the expected variables and types available.
+- **Admission environment construction**: `NewEvaluator` creates the correct admission CEL environment with the expected variables and types available.
 - **Version gating**: `WithVersion(1, 28)` correctly makes `ip()` unavailable (introduced in 1.30); `WithVersion(1, 34)` makes all current libraries available.
 - **Preamble variable ordering**: Preamble variables are evaluated before policy variables; policy variables can reference preamble results via `variables.*`.
 - **EvalAdmission correctness**: Known-good and known-bad policies produce the expected `Allowed`/`Violations` results.
