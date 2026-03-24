@@ -64,7 +64,6 @@ Users writing CEL expressions for Kubernetes must currently either deploy to a c
 - Provide a Go package that can evaluate CEL expressions in the real K8s CEL environment, starting with admission-style features (VAP, MAP, matchConditions) and designed to extend to other CEL contexts (CRD validation, DRA, AuthN, AuthZ) in follow-up KEPs.
 - Support **per-expression**, **per-variable**, **whole-policy**, and **compile-check** testing levels.
 - Enable **shift-left** testing: pure Go, zero cluster dependency, sub-second test runs.
-- Support **feature-specific presets** (future) so users get the correct variables, types, and libraries for each K8s CEL context. In the MVP, the correct environment is selected by calling the appropriate `Eval*` method.
 - Support **K8s version pinning** for reproducible tests across Kubernetes releases.
 - Support **framework preamble variables** (e.g., Gatekeeper's `anyObject`/`params`) so policy frameworks can inject their runtime variables into the test environment.
 - Provide a **declarative test format** (`*_test.cel`) for YAML-based test cases colocated with policy source.
@@ -72,7 +71,7 @@ Users writing CEL expressions for Kubernetes must currently either deploy to a c
 
 ### Non-Goals
 
-- **Replacing gator or other integration test tools.** This package tests CEL expressions in isolation; gator tests full ConstraintTemplate + suite.yaml end-to-end.
+- **Replacing framework-specific integration test tools** (e.g., Gatekeeper's `gator test`). This package tests CEL expressions in isolation; framework tools test full policy objects end-to-end.
 - **Runtime evaluation in production.** This is a `testing`-only package, not an admission controller or policy engine.
 - **Replacing `kubectl-validate` or schema validation.** This package evaluates CEL expressions, not Kubernetes resource schemas.
 
@@ -86,16 +85,7 @@ As a ValidatingAdmissionPolicy author, I want to test my CEL validation expressi
 **Story 2: Gatekeeper Policy Developer**
 As a Gatekeeper library contributor, I want to test individual CEL variables (e.g., `containers`, `badContainers`) in isolation so that I can debug policy logic at the expression level, not just pass/fail at the whole-policy level. I need the test environment to include Gatekeeper's injected preamble variables (`anyObject`, `params`).
 
-**Story 3: DRA Driver Developer**
-As a Dynamic Resource Allocation driver author, I want to test my device selector CEL expressions with the correct DRA environment (custom `Semver` type, map-with-default attribute lookups) so that I can validate selectors before deploying drivers.
-
-**Story 4: K8s AuthN/AuthZ Config Author**
-As a cluster administrator configuring OIDC claims mapping or authorization webhook match conditions, I want to verify my CEL expressions compile and evaluate correctly against sample JWT claims and SubjectAccessReview specs.
-
-**Story 5: CRD Validation Rule Author**
-As a CRD developer adding `x-kubernetes-validations` rules to my custom resource, I want to test expressions like `self.spec.replicas <= self.spec.maxReplicas` locally so that I can catch type errors and logic bugs before applying the CRD to a cluster. CRD validation rules are the most widely-used CEL feature in Kubernetes — every CRD with validation rules needs this.
-
-**Story 6: Policy Author (CLI)**
+**Story 3: Policy Author (CLI)**
 As a security team lead who writes VAP policies in YAML but not Go, I want to run `celtest run src/...` in CI to validate all my CEL expressions without maintaining Go test files or understanding Go tooling.
 
 ### Risks and Mitigations
@@ -105,7 +95,7 @@ The package lives in `k8s.io/apiserver`, which is a large module. Users who only
 *Mitigation:* This is a `testing`-only package—it is imported only in `*_test.go` files, so the dependency does not affect production binaries. If dependency weight becomes a concern, the package can be extracted to `sigs.k8s.io/cel-testing` in a later phase.
 
 **Risk: Environment drift between test package and production.**
-If the test package constructs its CEL environment differently from the real admission/CRD/DRA code paths, tests could pass but production could fail.
+If the test package constructs its CEL environment differently from the real admission code paths, tests could pass but production could fail.
 *Mitigation:* The evaluator reuses upstream K8s code across the following layers:
 
 | Layer | Upstream code reused | Fidelity | Notes |
@@ -120,10 +110,6 @@ If the test package constructs its CEL environment differently from the real adm
 The evaluation loop is the one piece that is reimplemented rather than called directly. The upstream `ForInput()` method (in [condition.go](https://github.com/kubernetes/kubernetes/blob/master/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/condition.go) and [composition.go](https://github.com/kubernetes/kubernetes/blob/master/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/composition.go)) requires `admission.VersionedAttributes` — a type tied to the full K8s admission pipeline — which cannot be cleanly constructed from unstructured test input. The activation bindings are implemented in [activation.go](https://github.com/kubernetes/kubernetes/blob/master/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/activation.go) (`evaluationActivation` struct). The custom loop follows the same preamble → variables → validations ordering and uses the same `StoredExpressionsEnv` for evaluation.
 
 **This is why the package should live in `k8s.io/apiserver`**: inside the K8s tree, it can either call `ForInput()` directly (by constructing `VersionedAttributes` from internal types) or expose a simpler evaluation method that accepts unstructured inputs.
-
-**Risk: DRA lives in a separate module (`k8s.io/dynamic-resource-allocation`).**
-The DRA CEL environment cannot be reached from `k8s.io/apiserver` without a cross-module dependency.
-*Mitigation:* Phase 1-2 covers only apiserver-resident features (VAP, MAP, CRD, matchConditions). DRA support (Phase 3) either adds a dependency or lives in `k8s.io/dynamic-resource-allocation/cel/testing`. A thin orchestrator in `sigs.k8s.io/cel-testing` can unify them.
 
 **Risk: Version pinning backward compatibility.**
 If a user pins `WithVersion(1, 28)` but the package ships with K8s 1.33, the base environment code may have changed behavior for how it handles older version gating.
@@ -433,11 +419,8 @@ source: string        # Optional. Explicit path to the policy source file (relat
                       # Example: source: ../policy.yaml
                       # Example: source: my-vap.yaml
 feature: string       # Optional. CEL context/environment to use. Default: "admission".
-                      # Values: "admission" (VAP/MAP/matchConditions), "crd", "dra",
-                      #   "authn-claims", "authn-user", "authz".
-                      # In Phase 1, only "admission" is implemented; other values
-                      # produce a "not yet supported" error.
-                      # When "crd" is set (Phase 2+): object → self, oldObject → oldSelf.
+                      # Currently only "admission" (VAP/MAP/matchConditions) is supported.
+                      # Additional values may be added by follow-up KEPs.
 tests:                # Required. Array of TestCase, minimum 1.
   - name: string      # Required. Unique within file. Used as Go subtest name.
 
@@ -531,18 +514,9 @@ import (
 // CEL environment (environment.MustBaseEnvSet). It supports version-pinning,
 // preamble variables (for framework injection), and admission-style evaluation.
 //
-// Phase 1 focuses on admission-style CEL (VAP, MAP, matchConditions).
-// Future phases will extend the evaluator or introduce feature-specific
-// evaluator types for other CEL contexts:
-//
-//   - Evaluator (Phase 1): VAP, MAP, matchConditions
-//   - CRDEvaluator (Phase 2, separate KEP): CRD x-kubernetes-validations
-//   - DRAEvaluator (Phase 3, separate KEP): DRA device selectors
-//   - AuthNEvaluator / AuthZEvaluator (Phase 4, separate KEP): AuthN/AuthZ
-//
-// All evaluators share environment.MustBaseEnvSet(ver) and WithVersion semantics.
-// This KEP defines only Evaluator. Future evaluators will be designed
-// in their respective KEPs with input from the teams that own those features.
+// This evaluator focuses on admission-style CEL (VAP, MAP, matchConditions).
+// Support for other CEL contexts (CRD, DRA, AuthN/AuthZ) will be proposed
+// in separate follow-up KEPs.
 type Evaluator struct {
     envSet           *environment.EnvSet
     version          *version.Version
@@ -658,13 +632,6 @@ const PerCallLimit = celconfig.PerCallLimit  // currently 1,000,000 (from k8s.io
 
 // EvalAdmission evaluates a VAP/MAP/matchCondition policy against admission input.
 func (e *Evaluator) EvalAdmission(policy *VAPPolicy, input *AdmissionInput) (*AdmissionResult, error) { ... }
-
-// ========== Future Feature-Specific Evaluators ==========
-//
-// Future CEL contexts (CRD, DRA, AuthN/AuthZ) will get their own evaluator types
-// in separate KEPs — see Evaluator doc comment above for the planned list.
-// In the meantime, EvalExpression() provides basic testing for any CEL expression
-// using the admission-style environment with DynType variables.
 
 // ========== Common / Cross-Feature ==========
 
@@ -970,7 +937,7 @@ func TestFilterExpression(t *testing.T) {
 
 | Tool | Env Accuracy | API | Cluster | Scope |
 |---|---|---|---|---|
-| **This proposal** | ✅ Real K8s env | ✅ Simple Go API | ❌ No | Phase 1: Admission (VAP, MAP, matchConditions); Phases 2-4 planned: CRD, DRA, AuthN/AuthZ |
+| **This proposal** | ✅ Real K8s env | ✅ Simple Go API | ❌ No | Admission (VAP, MAP, matchConditions) |
 | gator CLI | ✅ Real K8s env | ⚠️ YAML suite files | ❌ No | Gatekeeper policies only (OPA + CEL templates) |
 | kaptest | ⚠️ Third-party | ✅ Simple | ❌ No | VAP only |
 | kubectl-validate (#130570) | ✅ Real K8s env | ⚠️ CLI tool | ❌ No | Schema validation |
@@ -1025,7 +992,7 @@ celtest compile src/
 | Flag | Type | Default | Description |
 |---|---|---|---|
 | `--version` | `string` | latest | K8s compatibility version. Restricts available libraries. |
-| `--feature` | `string` | `admission` | CEL context: `admission`, `crd`, `dra`, `authn-claims`, `authn-user`, `authz`. Determines which variables and types are available. |
+| `--feature` | `string` | `admission` | CEL context. Currently only `admission` (VAP/MAP/matchConditions) is supported. |
 | `--output` / `-o` | `string` | `text` | Output format: `text`, `json`. |
 
 ##### `celtest eval '<expression>' [flags]`
@@ -1057,7 +1024,7 @@ celtest eval 'semver("1.2.3").isGreaterThan(semver("1.0.0"))' --version 1.33
 | `--params` | `string` | Path/inline for `params` variable. |
 | `--request` | `string` | Path/inline for `request` variable. Default: `{"operation":"CREATE"}`. |
 | `--version` | `string` | K8s compatibility version. |
-| `--feature` | `string` | CEL context (same as `compile`). |
+| `--feature` | `string` | CEL context. Currently only `admission` (same as `compile`). |
 
 #### Exit Codes
 
@@ -1185,20 +1152,7 @@ Evaluation errors show the test name, expression, and runtime error:
 
 Wraps the upstream Go library in a standalone CLI. See [CLI Tool Design](#cli-tool-design) for commands, flags, output formats, and configuration. Installable via `go install sigs.k8s.io/cel-test/cmd/celtest@latest`.
 
-#### Phase 2: CRD Validation Rules (separate follow-up KEP)
-- `CRDEvaluator` with `EvalRule()` method, `self` / `oldSelf` variables, required OpenAPI schema input
-- Schema-aware type checking and transition rule support
-- CRD env is built in `k8s.io/apiextensions-apiserver` via `prepareEnvSet()` — whether the evaluator takes a dependency on that module or reimplements will be resolved in the Phase 2 KEP
-
-#### Phase 3: DRA Device Selectors (separate follow-up KEP)
-- `DRAEvaluator` with `EvalSelector()` method, typed `DRADevice` variable
-- Lives in `k8s.io/dynamic-resource-allocation/cel/testing` due to cross-module boundary
-
-#### Phase 4: Authentication & Authorization (separate follow-up KEP)
-- `AuthNClaimsEvaluator`, `AuthNUserEvaluator`, `AuthZEvaluator` — separate evaluator types following the per-feature pattern
-
-#### Phase 5: Advanced Features
-- Authorizer mock support, `testing.T` assertion helpers, benchmark support for cost comparison
+> Support for additional CEL contexts (CRD validation, DRA, AuthN/AuthZ) and advanced features (mock authorizer, assertion helpers) will be proposed in separate follow-up KEPs.
 
 ### Graduation Criteria
 
@@ -1223,26 +1177,13 @@ Wraps the upstream Go library in a standalone CLI. See [CLI Tool Design](#cli-to
 - Cost tracking matches production behavior
 - Documentation published on kubernetes.io
 
-> **Note:** Phases 2–4 (CRD, DRA, AuthN/AuthZ) will be proposed as separate follow-up KEPs with independent graduation criteria.
-
 ### Open Questions for sig-api-machinery
 
+1. **Should this package provide assertion helpers (`celtest.RequireAllowed(t, result)`) or keep it minimal?**
+   **Proposed: Keep the core API minimal.** Assertion helpers can be added later or by downstream projects.
 
-1. **Should AuthN's dual-env pattern (claims vs user) be modeled as two methods on one evaluator or two separate evaluator types?**
-   **Proposed: Two separate evaluator types** (`AuthNClaimsEvaluator`, `AuthNUserEvaluator`) following the per-feature evaluator pattern. To be designed in the Phase 4 KEP.
-
-2. **How should CRD schema-typed `self`/`oldSelf` be handled — require OpenAPI schema input, or support untyped `DynType` for simpler testing?**
-   **Proposed: Require OpenAPI schema.** Schema-typed `self` is the primary value of CRD validation testing — without it, type errors (the most common CRD validation bugs) cannot be caught. CRD authors already have their schema in their CRD YAML. For quick untyped testing, `EvalExpression()` with the admission environment is sufficient.
-
-3. **Should this package provide assertion helpers (`celtest.RequireAllowed(t, result)`) or keep it minimal?**
-   **Proposed: Keep the core API minimal.** Assertion helpers (`celtest.RequireAllowed`) can be added in Phase 5 or by downstream projects.
-
-4. **What's the right level of cost tracking granularity to expose in test results?**
+2. **What's the right level of cost tracking granularity to expose in test results?**
    **Proposed: Expose total cost as `int64` on result types.** Per-expression cost breakdown is future work.
-
-5. **How should feature gates that affect CEL environment construction be handled in the test package?**
-   Some CEL contexts include types or variables gated by K8s feature gates — e.g., AuthZ's `fieldSelector`/`labelSelector` types are only present when `AuthorizeWithSelectors` is enabled, and DRA's `allowMultipleAllocations` field is gated by `ConsumableCapacity`. These gates are checked at environment construction time (in `mustBuildEnv()`/`newCompiler()`), not at evaluation time, so `WithVersion()` alone cannot toggle them.
-   **Proposed: Note as a known limitation for Phase 1.** The admission evaluator (Phase 1) is not affected — admission `OptionalVariableDeclarations` flags (`HasParams`, `HasPatchTypes`) are controlled by the evaluator, not by feature gates. `HasAuthorizer` is not enabled in Phase 1 (see Phase 1a note). The Phase 4 KEP (AuthN/AuthZ) and Phase 3 KEP (DRA) will need to address this — likely by enabling the superset environment by default (matching the pattern of `HasPatchTypes: true` in Phase 1) or by adding a `WithFeatureGates()` option.
 
 ## Test Plan
 
@@ -1270,7 +1211,7 @@ Integration testing is deferred to adopting projects (gatekeeper-library, upstre
 
 gator already provides CEL testing for Gatekeeper policies via `suite.yaml`. However:
 - gator is Gatekeeper-specific — it requires `ConstraintTemplate` CRDs and Gatekeeper's variable injection model.
-- gator only covers Gatekeeper admission policies (both OPA and CEL templates). It cannot test CRD validation rules, DRA selectors, AuthN/AuthZ expressions, or non-Gatekeeper VAPs.
+- gator only covers Gatekeeper admission policies (both OPA and CEL templates). It cannot test non-Gatekeeper VAPs or other K8s CEL use cases.
 - gator tests whole policies, not individual expressions or variables.
 
 This proposal complements gator by providing expression-level and cross-feature testing that gator does not address.
