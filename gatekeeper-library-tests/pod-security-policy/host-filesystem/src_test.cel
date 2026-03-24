@@ -1,0 +1,48 @@
+tests:
+# Based on gatekeeper-library/library/pod-security-policy/host-filesystem/samples/
+
+- name: "allows pod without hostPath volumes"
+  object:
+    metadata:
+      name: nginx-no-hostpath
+    spec:
+      containers:
+      - name: nginx
+        image: nginx
+  expect:
+    allowed: true
+
+- name: "denies pod with hostPath when no paths allowed"
+  object:
+    metadata:
+      name: nginx-hostpath-disallowed
+    spec:
+      containers:
+      - name: nginx
+        image: nginx
+        volumeMounts:
+        - name: data
+          mountPath: /data
+      volumes:
+      - name: data
+        hostPath:
+          path: /data
+  expect:
+    allowed: false
+
+- name: "allows on UPDATE"
+  request:
+    operation: UPDATE
+  object:
+    metadata:
+      name: test
+    spec:
+      containers:
+      - name: nginx
+        image: nginx
+      volumes:
+      - name: data
+        hostPath:
+          path: /data
+  expect:
+    allowed: true

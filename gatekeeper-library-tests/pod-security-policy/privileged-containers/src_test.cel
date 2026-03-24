@@ -1,0 +1,88 @@
+tests:
+# Based on gatekeeper-library/library/pod-security-policy/privileged-containers/samples/
+
+- name: "allows non-privileged container"
+  object:
+    metadata:
+      name: nginx-privileged-allowed
+    spec:
+      containers:
+      - name: nginx
+        image: nginx
+        securityContext:
+          privileged: false
+  expect:
+    allowed: true
+
+- name: "denies privileged container"
+  object:
+    metadata:
+      name: nginx-privileged-disallowed
+    spec:
+      containers:
+      - name: nginx
+        image: nginx
+        securityContext:
+          privileged: true
+      initContainers:
+      - name: nginx-init
+        image: nginx
+        securityContext:
+          privileged: true
+  expect:
+    allowed: false
+
+- name: "allows exempt image even if privileged"
+  params:
+    spec:
+      parameters:
+        exemptImages:
+        - "safeimages.com/*"
+  object:
+    metadata:
+      name: nginx-privileged-allowed-exempt
+    spec:
+      containers:
+      - name: nginx
+        image: safeimages.com/nginx
+        securityContext:
+          privileged: true
+  expect:
+    allowed: true
+
+- name: "allows on UPDATE regardless"
+  request:
+    operation: UPDATE
+  object:
+    metadata:
+      name: test
+    spec:
+      containers:
+      - name: nginx
+        image: nginx
+        securityContext:
+          privileged: true
+  expect:
+    allowed: true
+
+- name: "containers variable extracts spec.containers"
+  variable: containers
+  object:
+    spec:
+      containers:
+      - name: nginx
+        image: nginx
+  expect:
+    size: 1
+
+- name: "badContainers finds privileged"
+  variable: badContainers
+  object:
+    spec:
+      containers:
+      - name: nginx
+        image: nginx
+        securityContext:
+          privileged: true
+  expect:
+    size: 1

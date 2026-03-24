@@ -1,0 +1,58 @@
+tests:
+# Based on gatekeeper-library/library/general/requiredlabels/samples/
+
+- name: "allows namespace with required label matching regex"
+  params:
+    spec:
+      parameters:
+        labels:
+        - key: owner
+          allowedRegex: "^[a-zA-Z]+.agilebank.demo$"
+  object:
+    metadata:
+      name: test-ns
+      labels:
+        owner: "user.agilebank.demo"
+  expect:
+    allowed: true
+
+- name: "denies namespace missing required label"
+  params:
+    spec:
+      parameters:
+        labels:
+        - key: owner
+  object:
+    metadata:
+      name: test-ns
+  expect:
+    allowed: false
+
+- name: "denies namespace with label not matching regex"
+  params:
+    spec:
+      parameters:
+        labels:
+        - key: owner
+          allowedRegex: "^[a-zA-Z]+.agilebank.demo$"
+  object:
+    metadata:
+      name: test-ns
+      labels:
+        owner: "random-value"
+  expect:
+    allowed: false
+
+- name: "allows when label key present (no regex)"
+  params:
+    spec:
+      parameters:
+        labels:
+        - key: owner
+  object:
+    metadata:
+      name: test-ns
+      labels:
+        owner: "anything"
+  expect:
+    allowed: true

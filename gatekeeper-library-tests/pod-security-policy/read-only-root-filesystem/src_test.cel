@@ -1,0 +1,70 @@
+tests:
+# Based on gatekeeper-library/library/pod-security-policy/read-only-root-filesystem/samples/
+
+- name: "allows pod with readOnlyRootFilesystem=true"
+  object:
+    metadata:
+      name: nginx-readonly-allowed
+    spec:
+      containers:
+      - name: nginx
+        image: nginx
+        securityContext:
+          readOnlyRootFilesystem: true
+  expect:
+    allowed: true
+
+- name: "denies pod with readOnlyRootFilesystem=false"
+  object:
+    metadata:
+      name: nginx-readonly-disallowed
+    spec:
+      containers:
+      - name: nginx
+        image: nginx
+        securityContext:
+          readOnlyRootFilesystem: false
+  expect:
+    allowed: false
+
+- name: "denies pod without readOnlyRootFilesystem set"
+  object:
+    metadata:
+      name: nginx-no-readonly
+    spec:
+      containers:
+      - name: nginx
+        image: nginx
+  expect:
+    allowed: false
+
+- name: "allows exempt image with wildcard"
+  params:
+    spec:
+      parameters:
+        exemptImages:
+        - "*"
+  object:
+    metadata:
+      name: nginx-exempt
+    spec:
+      containers:
+      - name: nginx
+        image: nginx
+        securityContext:
+          readOnlyRootFilesystem: false
+  expect:
+    allowed: true
+
+- name: "allows on UPDATE"
+  request:
+    operation: UPDATE
+  object:
+    metadata:
+      name: test
+    spec:
+      containers:
+      - name: nginx
+        image: nginx
+  expect:
+    allowed: true

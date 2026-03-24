@@ -1,0 +1,72 @@
+tests:
+# Based on gatekeeper-library/library/pod-security-policy/allow-privilege-escalation/samples/
+
+- name: "allows container with allowPrivilegeEscalation=false"
+  object:
+    metadata:
+      name: nginx-privilege-escalation-allowed
+    spec:
+      containers:
+      - name: nginx
+        image: nginx
+        securityContext:
+          allowPrivilegeEscalation: false
+  expect:
+    allowed: true
+
+- name: "denies container with allowPrivilegeEscalation=true"
+  object:
+    metadata:
+      name: nginx-privilege-escalation-disallowed
+    spec:
+      containers:
+      - name: nginx
+        image: nginx
+        securityContext:
+          allowPrivilegeEscalation: true
+  expect:
+    allowed: false
+
+- name: "allows exempt image"
+  params:
+    spec:
+      parameters:
+        exemptImages:
+        - "safeimages.com/*"
+  object:
+    metadata:
+      name: nginx-privilege-escalation-exempt
+    spec:
+      containers:
+      - name: nginx
+        image: safeimages.com/nginx
+        securityContext:
+          allowPrivilegeEscalation: true
+  expect:
+    allowed: true
+
+- name: "denies when no securityContext set (default allows escalation)"
+  object:
+    metadata:
+      name: nginx-no-secctx
+    spec:
+      containers:
+      - name: nginx
+        image: nginx
+  expect:
+    allowed: false
+
+- name: "allows on UPDATE"
+  request:
+    operation: UPDATE
+  object:
+    metadata:
+      name: test
+    spec:
+      containers:
+      - name: nginx
+        image: nginx
+        securityContext:
+          allowPrivilegeEscalation: true
+  expect:
+    allowed: true

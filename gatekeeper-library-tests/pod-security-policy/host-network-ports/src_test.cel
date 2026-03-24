@@ -1,0 +1,75 @@
+tests:
+# Based on gatekeeper-library/library/pod-security-policy/host-network-ports/samples/
+
+- name: "allows pod without host network or ports"
+  params:
+    spec:
+      parameters:
+        hostNetwork: false
+        min: 0
+        max: 0
+  object:
+    metadata:
+      name: nginx-host-networking-allowed
+    spec:
+      containers:
+      - name: nginx
+        image: nginx
+  expect:
+    allowed: true
+
+- name: "denies pod with hostNetwork when not allowed"
+  params:
+    spec:
+      parameters:
+        hostNetwork: false
+        min: 0
+        max: 0
+  object:
+    metadata:
+      name: nginx-host-networking-disallowed
+    spec:
+      hostNetwork: true
+      containers:
+      - name: nginx
+        image: nginx
+  expect:
+    allowed: false
+
+- name: "allows hostNetwork when param allows it"
+  params:
+    spec:
+      parameters:
+        hostNetwork: true
+        min: 0
+        max: 65535
+  object:
+    metadata:
+      name: nginx-host-networking-ok
+    spec:
+      hostNetwork: true
+      containers:
+      - name: nginx
+        image: nginx
+  expect:
+    allowed: true
+
+- name: "allows on UPDATE"
+  request:
+    operation: UPDATE
+  params:
+    spec:
+      parameters:
+        hostNetwork: false
+        min: 0
+        max: 0
+  object:
+    metadata:
+      name: test
+    spec:
+      hostNetwork: true
+      containers:
+      - name: nginx
+        image: nginx
+  expect:
+    allowed: true

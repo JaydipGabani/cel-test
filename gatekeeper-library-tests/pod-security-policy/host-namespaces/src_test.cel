@@ -1,0 +1,42 @@
+tests:
+# Based on gatekeeper-library/library/pod-security-policy/host-namespaces/samples/
+
+- name: "allows pod without host namespaces"
+  object:
+    metadata:
+      name: nginx-host-namespace-allowed
+    spec:
+      hostPID: false
+      hostIPC: false
+      containers:
+      - name: nginx
+        image: nginx
+  expect:
+    allowed: true
+
+- name: "denies pod with hostPID"
+  object:
+    metadata:
+      name: nginx-host-namespace-disallowed
+    spec:
+      hostPID: true
+      hostIPC: true
+      containers:
+      - name: nginx
+        image: nginx
+  expect:
+    allowed: false
+
+- name: "allows on UPDATE"
+  request:
+    operation: UPDATE
+  object:
+    metadata:
+      name: test
+    spec:
+      hostPID: true
+      containers:
+      - name: nginx
+        image: nginx
+  expect:
+    allowed: true

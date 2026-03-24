@@ -53,7 +53,7 @@ Kubernetes uses CEL (Common Expression Language) across 7 use cases spanning 5 d
 1. **A Go testing package** (`k8s.io/apiserver/pkg/cel/testing/celtest`) that wraps the existing K8s CEL infrastructure into a simple API for evaluating CEL expressions in Go tests — using the real K8s CEL environment, not a custom one.
 2. **A standalone CLI tool** (`kubernetes-sigs/cel-test`) that discovers and runs declarative `*_test.cel` YAML test files so that policy authors who don't write Go can test CEL expressions locally.
 
-**Scope of this KEP:** This KEP delivers admission-style CEL testing (VAP, MAP expression testing, matchConditions) via the Go library and CLI. Support for other CEL contexts (CRD validation, DRA, AuthN/AuthZ) will be proposed in separate follow-up KEPs.
+**Scope of this KEP:** This KEP delivers admission-style CEL testing (VAP, MAP expression testing, matchConditions) via the Go library and CLI. Support for other CEL contexts (CRD validation, DRA, AuthN/AuthZ) should be proposed in separate KEPs.
 
 ## Motivation
 
@@ -150,7 +150,7 @@ Upstream changes required in `kubernetes/kubernetes`:
 **New package: `k8s.io/apiserver/pkg/cel/testing/celtest`** — core deliverable of Phase 1a:
 
 | File | Contents |
-|---|---|---|
+|---|---|
 | `evaluator.go` | `Evaluator`, `NewEvaluator()`, `EvalAdmission()`, `EvalExpression()`, `EvalVariable()`, `CompileCheck()`, options |
 | `parse.go` | `ParseVAPPolicy()`, `ParseVAPPolicyFile()` — YAML parsing for `.cel` policy files |
 | `runner.go` | `DiscoverAndRunTestsRaw()`, `DiscoverAndRunTestsWithEvaluator()`, `RunTestFileWithEvaluator()` |
@@ -165,7 +165,7 @@ Everything else — CLI tool, framework preambles, output formatters, config, ex
 
 **2. CLI tool → `kubernetes-sigs/cel-test` (Phase 1b)** — standalone CLI wrapping the Go library. Handles command/flag parsing, file discovery, output formatting (text, JSON, JUnit), and `.celtest.yaml` config. Follows the precedent of `kubernetes-sigs/kubectl-validate`.
 
-Commands: `celtest run src/...`, `celtest compile src/policy/src.cel`, `celtest eval '<expr>' --object pod.yaml`
+Commands: `celtest run src/...`, `celtest compile src/policy/src.cel`
 
 ### Design Principles
 
@@ -511,16 +511,6 @@ The `celtest` CLI (`kubernetes-sigs/cel-test`, Phase 1b) delegates all CEL evalu
 | `--version` | `string` | latest | K8s compatibility version |
 | `--output` / `-o` | `string` | `text` | Output format: `text`, `json` |
 
-**`celtest eval '<expression>' [flags]`** — Evaluate a single CEL expression.
-
-| Flag | Type | Description |
-|---|---|---|
-| `--object` | `string` | YAML/JSON file or inline for `object` |
-| `--old-object` | `string` | For `oldObject` |
-| `--params` | `string` | For `params` |
-| `--request` | `string` | For `request` (default: `{"operation":"CREATE"}`) |
-| `--version` | `string` | K8s compatibility version |
-
 #### Exit Codes
 
 `0` = success, `1` = test failure, `2` = config error, `3` = compilation error.
@@ -558,11 +548,12 @@ Wraps the Go library. Installable via `go install sigs.k8s.io/cel-test/cmd/celte
 
 ### Graduation Criteria
 
-**Alpha:** Full admission evaluation (VAP/MAP/matchConditions), `celtest` CLI with `run`/`compile`/`eval`, unit tests for version pinning and preamble ordering.
+**Alpha:** Full admission evaluation (VAP/MAP/matchConditions), `celtest` CLI with `run`/`compile`, unit tests for version pinning and preamble ordering.
 
 **Beta:** API stable, declarative runner shipped, adopted by 1+ external project, integration test for `ForInput()` equivalence.
 
 **GA:** 2+ adopters, API stable for 2 releases, cost tracking matches production, docs on kubernetes.io.
+
 
 ## Test Plan
 
