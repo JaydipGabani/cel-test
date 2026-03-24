@@ -128,14 +128,14 @@ func runTestFileCLI(eval *celtest.Evaluator, testFilePath string, verbose bool) 
 		mode = "policy"
 	}
 
-	var policy *celtest.VAPPolicy
+	var policy *celtest.AdmissionPolicy
 	if mode == "policy" {
 		policyPath := companionPath(testFilePath)
 		if policyPath == "" {
 			fmt.Fprintf(os.Stderr, "ERROR: no companion policy for %s\n", testFilePath)
 			return 0, 1
 		}
-		policy, err = celtest.ParseVAPPolicyFile(policyPath)
+		policy, err = celtest.ParseAdmissionPolicyFile(policyPath)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "ERROR loading policy for %s: %v\n", testFilePath, err)
 			return 0, 1
@@ -167,7 +167,7 @@ func runTestFileCLI(eval *celtest.Evaluator, testFilePath string, verbose bool) 
 	return
 }
 
-func runOneTest(eval *celtest.Evaluator, policy *celtest.VAPPolicy, mode string, tc *testCase, input *celtest.AdmissionInput) (bool, string) {
+func runOneTest(eval *celtest.Evaluator, policy *celtest.AdmissionPolicy, mode string, tc *testCase, input *celtest.AdmissionInput) (bool, string) {
 	if tc.Variable != "" {
 		result, err := eval.EvalVariable(policy, tc.Variable, input)
 		if err != nil {
@@ -363,7 +363,7 @@ func compileCmd() *cobra.Command {
 			}
 			hasError := false
 			for _, path := range args {
-				policy, err := celtest.ParseVAPPolicyFile(path)
+				policy, err := celtest.ParseAdmissionPolicyFile(path)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "ERROR: %s: %v\n", path, err)
 					hasError = true

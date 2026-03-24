@@ -147,12 +147,12 @@ The building blocks exist in `k8s.io/apiserver` — they just aren't packaged fo
 
 Upstream changes required in `kubernetes/kubernetes`:
 
-**New package: `k8s.io/apiserver/pkg/cel/testing/celtest`** — core deliverable of Phase 1a:
+**New package: `k8s.io/apiserver/pkg/cel/testing/celtest`** — core deliverable of Phase 1a: 
 
 | File | Contents |
 |---|---|
 | `evaluator.go` | `Evaluator`, `NewEvaluator()`, `EvalAdmission()`, `EvalExpression()`, `EvalVariable()`, `CompileCheck()`, options |
-| `parse.go` | `ParseVAPPolicy()`, `ParseVAPPolicyFile()` — YAML parsing for `.cel` policy files |
+| `parse.go` | `ParseAdmissionPolicy()`, `ParseAdmissionPolicyFile()` — YAML parsing for `.cel` policy files |
 | `runner.go` | `DiscoverAndRunTestsRaw()`, `DiscoverAndRunTestsWithEvaluator()`, `RunTestFileWithEvaluator()` |
 
 **Modification: `k8s.io/apiserver/pkg/admission/plugin/cel/testing_helpers.go`** (new file) — exports `CreateTestEnv(baseEnv, opts)` (thin wrapper delegating to the unexported `createEnvForOpts()` in the same package) and `TestActivation` struct (implementing `interpreter.Activation` for unstructured inputs). A unit test (`TestCreateTestEnvEquivalence`) asserts equivalence with the production `mustBuildEnvs()` path. No changes to `compile.go` — `BuildRequestType()`, `BuildNamespaceType()`, `OptionalVariableDeclarations` are already exported.
@@ -346,7 +346,7 @@ type AdmissionInput struct {
     Namespace *corev1.Namespace
 }
 
-type VAPPolicy struct {
+type AdmissionPolicy struct {
     Variables   []Variable
     Validations []Validation
 }
@@ -371,7 +371,7 @@ func WithCostLimit(limit int64) Option { ... }
 const PerCallLimit = celconfig.PerCallLimit // 1,000,000
 
 // EvalAdmission evaluates a VAP/MAP/matchCondition policy against input.
-func (e *Evaluator) EvalAdmission(policy *VAPPolicy, input *AdmissionInput) (*AdmissionResult, error) { ... }
+func (e *Evaluator) EvalAdmission(policy *AdmissionPolicy, input *AdmissionInput) (*AdmissionResult, error) { ... }
 
 // EvalExpression evaluates a single CEL expression. All admission variables
 // are available. extraVars injects additional activation bindings (e.g.,
@@ -385,13 +385,13 @@ func (e *Evaluator) EvalExpression(expr string, input *AdmissionInput, extraVars
 // after the configured version.
 func (e *Evaluator) CompileCheck(expr string) error { ... }
 
-// ParseVAPPolicy parses a .cel policy file (top-level variables:/validations: keys).
-func ParseVAPPolicy(yamlContent string) (*VAPPolicy, error) { ... }
-func ParseVAPPolicyFile(path string) (*VAPPolicy, error) { ... }
+// ParseAdmissionPolicy parses a .cel policy file (top-level variables:/validations: keys).
+func ParseAdmissionPolicy(yamlContent string) (*AdmissionPolicy, error) { ... }
+func ParseAdmissionPolicyFile(path string) (*AdmissionPolicy, error) { ... }
 
 // EvalVariable evaluates a single named variable, running preamble + all
 // policy vars up to and including the target. Primary value add over whole-policy testing.
-func (e *Evaluator) EvalVariable(policy *VAPPolicy, variableName string, input *AdmissionInput) (interface{}, error) { ... }
+func (e *Evaluator) EvalVariable(policy *AdmissionPolicy, variableName string, input *AdmissionInput) (interface{}, error) { ... }
 
 // ========== Declarative Test Runner ==========
 
@@ -457,7 +457,7 @@ func newGatekeeperEvaluator() (*celtest.Evaluator, error) {
 
 func TestPrivilegedContainers(t *testing.T) {
     eval, _ := newGatekeeperEvaluator()
-    policy, _ := celtest.ParseVAPPolicyFile("src/pod-security-policy/privileged-containers/src.cel")
+    policy, _ := celtest.ParseAdmissionPolicyFile("src/pod-security-policy/privileged-containers/src.cel")
     result, err := eval.EvalAdmission(policy, &celtest.AdmissionInput{
         Object: map[string]interface{}{
             "metadata": map[string]interface{}{"name": "test-pod"},
@@ -535,7 +535,7 @@ Without a config file, the CLI runs in raw mode (`DiscoverAndRunTestsRaw`).
 #### Phase 1a: Core Go Library (MVP)
 - `NewEvaluator` with admission-style env (MAP extension enabled by default via `HasPatchTypes: true`)
 - `EvalAdmission`, `EvalExpression`, `EvalVariable`, `CompileCheck`
-- `ParseVAPPolicy` / `ParseVAPPolicyFile` helpers
+- `ParseAdmissionPolicy` / `ParseAdmissionPolicyFile` helpers
 - `WithVersion`, `WithPreambleVariables`, `WithCostLimit`
 - Declarative `*_test.cel` runner
 - MAP expression compilation and evaluation supported; MAP mutation *application* (patching objects) deferred

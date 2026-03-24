@@ -24,13 +24,13 @@ type validationEntry struct {
 	MessageExpression string `yaml:"messageExpression"`
 }
 
-func parseVAPPolicy(data []byte) (*VAPPolicy, error) {
+func parseAdmissionPolicy(data []byte) (*AdmissionPolicy, error) {
 	var pf policyFile
 	if err := yaml.Unmarshal(data, &pf); err != nil {
 		return nil, fmt.Errorf("parsing policy YAML: %w", err)
 	}
 
-	policy := &VAPPolicy{}
+	policy := &AdmissionPolicy{}
 	for _, v := range pf.Variables {
 		if v.Name == "" {
 			return nil, fmt.Errorf("variable missing name")
@@ -56,10 +56,10 @@ func parseVAPPolicy(data []byte) (*VAPPolicy, error) {
 	return policy, nil
 }
 
-func parseVAPPolicyFile(path string) (*VAPPolicy, error) {
+func parseAdmissionPolicyFile(path string) (*AdmissionPolicy, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("reading policy file %s: %w", path, err)
 	}
-	return parseVAPPolicy(data)
+	return parseAdmissionPolicy(data)
 }
