@@ -152,7 +152,7 @@ Upstream changes required in `kubernetes/kubernetes`:
 | File | Contents |
 |---|---|---|
 | `evaluator.go` | `Evaluator`, `NewEvaluator()`, `EvalAdmission()`, `EvalExpression()`, `EvalVariable()`, `CompileCheck()`, options |
-| `parse.go` | `ParseVAPPolicy()`, `ParsePolicySource()` — YAML parsing (lightweight + native K8s resource, auto-detected) |
+| `parse.go` | `ParseVAPPolicy()`, `ParseVAPPolicyFile()` — YAML parsing for `.cel` policy files |
 | `runner.go` | `DiscoverAndRunTestsRaw()`, `DiscoverAndRunTestsWithEvaluator()`, `RunTestFileWithEvaluator()` |
 
 **Modification: `k8s.io/apiserver/pkg/admission/plugin/cel/testing_helpers.go`** (new file) — exports `CreateTestEnv(baseEnv, opts)` (thin wrapper delegating to the unexported `createEnvForOpts()` in the same package) and `TestActivation` struct (implementing `interpreter.Activation` for unstructured inputs). A unit test (`TestCreateTestEnvEquivalence`) asserts equivalence with the production `mustBuildEnvs()` path. No changes to `compile.go` — `BuildRequestType()`, `BuildNamespaceType()`, `OptionalVariableDeclarations` are already exported.
@@ -194,18 +194,11 @@ The tooling supports four levels of testing, each addressing a different need:
 
 ### Declarative Test Format: `*_test.cel`
 
-Test files use the `*_test.cel` suffix convention (matching Go's `*_test.go` and OPA's `*_test.rego`). A test file is paired with its policy by base name: `foo.cel` (or `foo.yaml`) is tested by `foo_test.cel` in the same directory. Alternatively, `source:` can reference any policy file explicitly.
+Test files use the `*_test.cel` suffix convention (matching Go's `*_test.go` and OPA's `*_test.rego`). A test file is paired with its policy by base name: `foo.cel` is tested by `foo_test.cel` in the same directory. Alternatively, `source:` can reference any `.cel` policy file explicitly.
 
-**Discovery:** Walk for `*_test.cel` → find companion `foo.cel` / `foo.yaml` → auto-detect format (lightweight vs native K8s resource via `apiVersion`/`kind`). No companion → must be `mode: expression`.
+**Discovery:** Walk for `*_test.cel` → find companion `foo.cel` in the same directory. No companion → must be `mode: expression`.
 
-**Supported native K8s resource types:**
-
-| `apiVersion` | `kind` | Variables path | Validations path |
-|---|---|---|---|
-| `admissionregistration.k8s.io/v1` / `v1beta1` / `v1alpha1` | `ValidatingAdmissionPolicy` | `spec.variables` | `spec.validations` |
-| `admissionregistration.k8s.io/v1alpha1` / `v1beta1` | `MutatingAdmissionPolicy` | `spec.variables` | `spec.mutations` |
-
-The lightweight `src.cel` format (top-level `variables:` / `validations:` keys, no `apiVersion`/`kind`) is the recommended format for Gatekeeper libraries, Kyverno policies, and non-VAP/MAP use cases.
+Policy source files use the `.cel` extension with a simple YAML format: top-level `variables:` and/or `validations:` keys. This is the only supported policy source format — the tool does not parse native K8s resource YAML (`ValidatingAdmissionPolicy`, `MutatingAdmissionPolicy`, etc.). Users with VAP/MAP YAML manifests should extract their CEL expressions into `.cel` files for testing.
 
 ```yaml
 # src/pod-security-policy/privileged-containers/src_test.cel
@@ -263,7 +256,7 @@ func TestCELPolicies(t *testing.T) {
 ```yaml
 # TestFile schema
 mode: string          # Optional. "policy" (default) or "expression".
-source: string        # Optional. Explicit path to policy source (overrides auto-discovery).
+source: string        # Optional. Explicit path to a .cel policy file (overrides auto-discovery).
 tests:                # Required. Array of TestCase, minimum 1.
   - name: string      # Required. Unique within file. Used as Go subtest name.
 
@@ -392,13 +385,9 @@ func (e *Evaluator) EvalExpression(expr string, input *AdmissionInput, extraVars
 // after the configured version.
 func (e *Evaluator) CompileCheck(expr string) error { ... }
 
+// ParseVAPPolicy parses a .cel policy file (top-level variables:/validations: keys).
 func ParseVAPPolicy(yamlContent string) (*VAPPolicy, error) { ... }
 func ParseVAPPolicyFile(path string) (*VAPPolicy, error) { ... }
-
-// ParsePolicySource auto-detects format (apiVersion/kind → native K8s resource,
-// otherwise lightweight). Supports VAP (v1/v1beta1/v1alpha1) and MAP (v1alpha1/v1beta1).
-func ParsePolicySource(yamlContent string) (*VAPPolicy, error) { ... }
-func ParsePolicySourceFile(path string) (*VAPPolicy, error) { ... }
 
 // EvalVariable evaluates a single named variable, running preamble + all
 // policy vars up to and including the target. Primary value add over whole-policy testing.
@@ -556,7 +545,7 @@ Without a config file, the CLI runs in raw mode (`DiscoverAndRunTestsRaw`).
 #### Phase 1a: Core Go Library (MVP)
 - `NewEvaluator` with admission-style env (MAP extension enabled by default via `HasPatchTypes: true`)
 - `EvalAdmission`, `EvalExpression`, `EvalVariable`, `CompileCheck`
-- `ParseVAPPolicy` / `ParsePolicySource` helpers
+- `ParseVAPPolicy` / `ParseVAPPolicyFile` helpers
 - `WithVersion`, `WithPreambleVariables`, `WithCostLimit`
 - Declarative `*_test.cel` runner
 - MAP expression compilation and evaluation supported; MAP mutation *application* (patching objects) deferred
@@ -574,14 +563,6 @@ Wraps the Go library. Installable via `go install sigs.k8s.io/cel-test/cmd/celte
 **Beta:** API stable, declarative runner shipped, adopted by 1+ external project, integration test for `ForInput()` equivalence.
 
 **GA:** 2+ adopters, API stable for 2 releases, cost tracking matches production, docs on kubernetes.io.
-
-### Open Questions for sig-api-machinery
-
-1. **Should this package provide assertion helpers (`celtest.RequireAllowed(t, result)`) or keep it minimal?**
-   **Proposed: Keep the core API minimal.** Assertion helpers can be added later or by downstream projects.
-
-2. **What's the right level of cost tracking granularity to expose in test results?**
-   **Proposed: Expose total cost as `int64` on result types.** Per-expression cost breakdown is future work.
 
 ## Test Plan
 
